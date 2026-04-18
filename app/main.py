@@ -63,11 +63,11 @@ def read_client(connection, selector):
     connection.sendall(encode_simple_string("PONG"))
     return
 
-  if command == "ECHO" and len(command_parts) > 2:
+  if command == "ECHO" and len(command_parts) >= 2:
     connection.sendall(encode_bulk_string(command_parts[1]))
     return
   
-  if command == "SET" and len(command_parts) > 3:
+  if command == "SET" and len(command_parts) >= 3:
     key = command_parts[1]
     value = command_parts[2]
     store[key] = value
