@@ -1,5 +1,6 @@
 import socket  # noqa: F401
 import selectors  # noqa: F401
+import time
 
 store = {}
 
@@ -36,6 +37,19 @@ def encode_bulk_string(value):
     return b"$-1\r\n"
   return f"${len(value)}\r\n{value}\r\n".encode()
 
+
+def get_value(key):
+  entry = store.get(key)
+  if entry is None:
+    return None
+
+  value, expires_at = entry
+  if expires_at is not None and time.monotonic() >= expires_at:
+    del store[key]
+    return None
+
+  return value
+
 def accept_connection(server_socket, selector):
   connection, _ = server_socket.accept()
   connection.setblocking(False)
@@ -70,13 +84,24 @@ def read_client(connection, selector):
   if command == "SET" and len(command_parts) >= 3:
     key = command_parts[1]
     value = command_parts[2]
-    store[key] = value
+
+    expires_at = None
+    if len(command_parts) >= 5:
+      option = command_parts[3].upper()
+      option_value = command_parts[4]
+
+      if option == "PX":
+        expires_at = time.monotonic() + (int(option_value) / 1000)
+      elif option == "EX":
+        expires_at = time.monotonic() + int(option_value)
+
+    store[key] = (value, expires_at)
     connection.sendall(encode_simple_string("OK"))
     return
 
   if command == "GET" and len(command_parts) >= 2:
     key = command_parts[1]
-    connection.sendall(encode_bulk_string(store.get(key)))
+    connection.sendall(encode_bulk_string(get_value(key)))
     return
   
   connection.sendall(encode_simple_string("OK"))
