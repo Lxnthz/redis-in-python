@@ -73,6 +73,11 @@ def read_client(connection, selector):
     store[key] = value
     connection.sendall(encode_simple_string("OK"))
     return
+
+  if command == "GET" and len(command_parts) >= 2:
+    key = command_parts[1]
+    connection.sendall(encode_bulk_string(store.get(key)))
+    return
   
   connection.sendall(encode_simple_string("OK"))
 
