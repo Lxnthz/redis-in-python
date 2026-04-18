@@ -3,6 +3,7 @@ import selectors  # noqa: F401
 import time
 
 store = {}
+pending_blpop_requests = []
 
 def parse_resp_command(data):
   parts = data.split(b"\r\n")
@@ -155,23 +156,72 @@ def pop_from_list(key, count=None):
   return popped_items
 
 
-def blpop(keys, timeout_seconds):
-  deadline = time.monotonic() + timeout_seconds
+def try_pop_from_keys(keys):
+  for key in keys:
+    popped = pop_from_list(key)
+    if popped is not None:
+      return [key, popped]
 
-  while True:
-    for key in keys:
-      popped = pop_from_list(key)
-      if popped is not None:
-        return [key, popped]
+  return None
 
-    if timeout_seconds == 0:
-      time.sleep(0.01)
+
+def wake_pending_blpop_requests():
+  index = 0
+  while index < len(pending_blpop_requests):
+    request = pending_blpop_requests[index]
+    response = try_pop_from_keys(request["keys"])
+
+    if response is None:
+      index += 1
       continue
 
-    if time.monotonic() >= deadline:
-      return None
+    connection = request["connection"]
+    try:
+      connection.sendall(encode_array(response))
+    except OSError:
+      pass
 
-    time.sleep(0.01)
+    pending_blpop_requests.pop(index)
+
+
+def expire_pending_blpop_requests():
+  now = time.monotonic()
+
+  index = 0
+  while index < len(pending_blpop_requests):
+    request = pending_blpop_requests[index]
+    deadline = request["deadline"]
+
+    if deadline is None or now < deadline:
+      index += 1
+      continue
+
+    connection = request["connection"]
+    try:
+      connection.sendall(encode_array(None))
+    except OSError:
+      pass
+
+    pending_blpop_requests.pop(index)
+
+
+def get_selector_timeout():
+  if not pending_blpop_requests:
+    return None
+
+  nearest_deadline = None
+  for request in pending_blpop_requests:
+    deadline = request["deadline"]
+    if deadline is None:
+      continue
+
+    if nearest_deadline is None or deadline < nearest_deadline:
+      nearest_deadline = deadline
+
+  if nearest_deadline is None:
+    return None
+
+  return max(0, nearest_deadline - time.monotonic())
 
 def accept_connection(server_socket, selector):
   connection, _ = server_socket.accept()
@@ -238,6 +288,7 @@ def read_client(connection, selector):
 
     list_values.extend(values)
     connection.sendall(encode_integer(len(list_values)))
+    wake_pending_blpop_requests()
     return
 
   if command == "LPUSH" and len(command_parts) >= 3:
@@ -253,6 +304,7 @@ def read_client(connection, selector):
       list_values.insert(0, value)
 
     connection.sendall(encode_integer(len(list_values)))
+    wake_pending_blpop_requests()
     return
 
   if command == "LRANGE" and len(command_parts) >= 4:
@@ -300,13 +352,34 @@ def read_client(connection, selector):
   if command == "BLPOP" and len(command_parts) >= 3:
     keys = command_parts[1:-1]
     timeout_seconds = float(command_parts[-1])
-    response = blpop(keys, timeout_seconds)
-    connection.sendall(encode_array(response))
+    response = try_pop_from_keys(keys)
+    if response is not None:
+      connection.sendall(encode_array(response))
+      return
+
+    deadline = None
+    if timeout_seconds > 0:
+      deadline = time.monotonic() + timeout_seconds
+
+    pending_blpop_requests.append({
+      "connection": connection,
+      "keys": keys,
+      "deadline": deadline,
+    })
     return
   
   connection.sendall(encode_simple_string("OK"))
 
 def close_client(connection, selector):
+  index = 0
+  while index < len(pending_blpop_requests):
+    request = pending_blpop_requests[index]
+    if request["connection"] == connection:
+      pending_blpop_requests.pop(index)
+      continue
+
+    index += 1
+
   try:
     selector.unregister(connection)
   except Exception:
@@ -325,10 +398,12 @@ def main():
     selector.register(server_socket, selectors.EVENT_READ, accept_connection)
     
     while True:
-      events = selector.select()
+      events = selector.select(timeout=get_selector_timeout())
       for key, _ in events:
         callback = key.data
         callback(key.fileobj, selector)
+
+      expire_pending_blpop_requests()
 
 if __name__ == "__main__":
     main()
