@@ -38,17 +38,140 @@ def encode_bulk_string(value):
   return f"${len(value)}\r\n{value}\r\n".encode()
 
 
-def get_value(key):
+def encode_integer(value):
+  return f":{value}\r\n".encode()
+
+
+def encode_error(message):
+  return f"-{message}\r\n".encode()
+
+
+def encode_array(values):
+  if values is None:
+    return b"*-1\r\n"
+
+  response = f"*{len(values)}\r\n".encode()
+  for value in values:
+    response += encode_bulk_string(value)
+  return response
+
+
+def make_string_entry(value, expires_at=None):
+  return {"type": "string", "value": value, "expires_at": expires_at}
+
+
+def make_list_entry(values=None):
+  if values is None:
+    values = []
+
+  return {"type": "list", "value": values, "expires_at": None}
+
+
+def get_entry(key):
   entry = store.get(key)
   if entry is None:
     return None
 
-  value, expires_at = entry
+  expires_at = entry["expires_at"]
   if expires_at is not None and time.monotonic() >= expires_at:
     del store[key]
     return None
 
-  return value
+  return entry
+
+
+def get_value(key):
+  entry = get_entry(key)
+  if entry is None:
+    return None
+
+  if entry["type"] != "string":
+    return None
+
+  return entry["value"]
+
+
+def get_list_for_write(key):
+  entry = get_entry(key)
+  if entry is None:
+    store[key] = make_list_entry()
+    return store[key]["value"]
+
+  if entry["type"] != "list":
+    return None
+
+  return entry["value"]
+
+
+def get_list_for_read(key):
+  entry = get_entry(key)
+  if entry is None:
+    return []
+
+  if entry["type"] != "list":
+    return None
+
+  return entry["value"]
+
+
+def trim_lrange(values, start, stop):
+  length = len(values)
+  if length == 0:
+    return []
+
+  if start < 0:
+    start += length
+  if stop < 0:
+    stop += length
+
+  start = max(start, 0)
+  stop = min(stop, length - 1)
+
+  if start > stop or start >= length:
+    return []
+
+  return values[start:stop + 1]
+
+
+def pop_from_list(key, count=None):
+  list_values = get_list_for_read(key)
+  if list_values is None or len(list_values) == 0:
+    return None
+
+  if count is None:
+    popped = list_values.pop(0)
+    if len(list_values) == 0:
+      del store[key]
+    return popped
+
+  popped_items = []
+  pop_count = min(count, len(list_values))
+  for _ in range(pop_count):
+    popped_items.append(list_values.pop(0))
+
+  if len(list_values) == 0:
+    del store[key]
+
+  return popped_items
+
+
+def blpop(keys, timeout_seconds):
+  deadline = time.monotonic() + timeout_seconds
+
+  while True:
+    for key in keys:
+      popped = pop_from_list(key)
+      if popped is not None:
+        return [key, popped]
+
+    if timeout_seconds == 0:
+      time.sleep(0.01)
+      continue
+
+    if time.monotonic() >= deadline:
+      return None
+
+    time.sleep(0.01)
 
 def accept_connection(server_socket, selector):
   connection, _ = server_socket.accept()
@@ -95,13 +218,90 @@ def read_client(connection, selector):
       elif option == "EX":
         expires_at = time.monotonic() + int(option_value)
 
-    store[key] = (value, expires_at)
+    store[key] = make_string_entry(value, expires_at)
     connection.sendall(encode_simple_string("OK"))
     return
 
   if command == "GET" and len(command_parts) >= 2:
     key = command_parts[1]
     connection.sendall(encode_bulk_string(get_value(key)))
+    return
+
+  if command == "RPUSH" and len(command_parts) >= 3:
+    key = command_parts[1]
+    values = command_parts[2:]
+
+    list_values = get_list_for_write(key)
+    if list_values is None:
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    list_values.extend(values)
+    connection.sendall(encode_integer(len(list_values)))
+    return
+
+  if command == "LPUSH" and len(command_parts) >= 3:
+    key = command_parts[1]
+    values = command_parts[2:]
+
+    list_values = get_list_for_write(key)
+    if list_values is None:
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    for value in values:
+      list_values.insert(0, value)
+
+    connection.sendall(encode_integer(len(list_values)))
+    return
+
+  if command == "LRANGE" and len(command_parts) >= 4:
+    key = command_parts[1]
+    start = int(command_parts[2])
+    stop = int(command_parts[3])
+
+    list_values = get_list_for_read(key)
+    if list_values is None:
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    connection.sendall(encode_array(trim_lrange(list_values, start, stop)))
+    return
+
+  if command == "LLEN" and len(command_parts) >= 2:
+    key = command_parts[1]
+    list_values = get_list_for_read(key)
+
+    if list_values is None:
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    connection.sendall(encode_integer(len(list_values)))
+    return
+
+  if command == "LPOP" and len(command_parts) >= 2:
+    key = command_parts[1]
+
+    if len(command_parts) >= 3:
+      count = int(command_parts[2])
+      popped_items = pop_from_list(key, count)
+
+      if popped_items is None:
+        connection.sendall(encode_array(None))
+        return
+
+      connection.sendall(encode_array(popped_items))
+      return
+
+    popped_item = pop_from_list(key)
+    connection.sendall(encode_bulk_string(popped_item))
+    return
+
+  if command == "BLPOP" and len(command_parts) >= 3:
+    keys = command_parts[1:-1]
+    timeout_seconds = float(command_parts[-1])
+    response = blpop(keys, timeout_seconds)
+    connection.sendall(encode_array(response))
     return
   
   connection.sendall(encode_simple_string("OK"))
