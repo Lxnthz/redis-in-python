@@ -2,6 +2,7 @@ import socket  # noqa: F401
 import selectors  # noqa: F401
 import sys
 import time
+import random
 
 store = {}
 key_versions = {}
@@ -9,6 +10,20 @@ pending_blpop_requests = []
 pending_xread_requests = []
 transaction_commands = {}
 watched_keys = {}
+connection_buffers = {}
+
+role = "master"
+listen_port = 6379
+master_host = None
+master_port = None
+master_connection = None
+master_replid = ""
+master_repl_offset = 0
+replica_processed_offset = 0
+replica_ack_offsets = {}
+replica_connections = set()
+
+EMPTY_RDB_HEX = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 
 def parse_resp_command(data):
   parts = data.split(b"\r\n")
@@ -34,6 +49,282 @@ def parse_resp_command(data):
     i += 1
     
   return items
+
+
+def parse_resp_array_message(buffer, start_index):
+  if start_index >= len(buffer) or buffer[start_index:start_index + 1] != b"*":
+    return None
+
+  line_end = buffer.find(b"\r\n", start_index)
+  if line_end == -1:
+    return None
+
+  try:
+    item_count = int(buffer[start_index + 1:line_end])
+  except ValueError:
+    return None
+
+  index = line_end + 2
+  parts = []
+
+  for _ in range(item_count):
+    if index >= len(buffer):
+      return None
+
+    if buffer[index:index + 1] != b"$":
+      return None
+
+    bulk_end = buffer.find(b"\r\n", index)
+    if bulk_end == -1:
+      return None
+
+    try:
+      bulk_len = int(buffer[index + 1:bulk_end])
+    except ValueError:
+      return None
+
+    value_start = bulk_end + 2
+    value_end = value_start + bulk_len
+    if value_end + 2 > len(buffer):
+      return None
+
+    if buffer[value_end:value_end + 2] != b"\r\n":
+      return None
+
+    parts.append(buffer[value_start:value_end].decode())
+    index = value_end + 2
+
+  return parts, index
+
+
+def extract_resp_commands(connection, data):
+  existing = connection_buffers.get(connection, b"")
+  buffer = existing + data
+
+  commands = []
+  offset = 0
+
+  while offset < len(buffer):
+    parsed = parse_resp_array_message(buffer, offset)
+    if parsed is None:
+      break
+
+    parts, next_offset = parsed
+    raw_command = buffer[offset:next_offset]
+    commands.append((parts, raw_command))
+    offset = next_offset
+
+  connection_buffers[connection] = buffer[offset:]
+  return commands
+
+
+def parse_server_config(argv):
+  global role
+  global listen_port
+  global master_host
+  global master_port
+
+  index = 1
+  while index < len(argv):
+    token = argv[index]
+
+    if token == "--port" and index + 1 < len(argv):
+      listen_port = int(argv[index + 1])
+      index += 2
+      continue
+
+    if token == "--replicaof" and index + 1 < len(argv):
+      replicaof_value = argv[index + 1]
+      host_port = replicaof_value.split()
+      if len(host_port) == 2:
+        master_host = host_port[0]
+        master_port = int(host_port[1])
+      elif index + 2 < len(argv):
+        master_host = argv[index + 1]
+        master_port = int(argv[index + 2])
+        index += 1
+
+      role = "slave"
+      index += 2
+      continue
+
+    index += 1
+
+
+def random_replid():
+  alphabet = "0123456789abcdef"
+  return "".join(random.choice(alphabet) for _ in range(40))
+
+
+def connect_to_master_and_handshake(selector):
+  global master_connection
+
+  if master_host is None or master_port is None:
+    return
+
+  connection = socket.create_connection((master_host, master_port))
+  connection.settimeout(5)
+
+  connection.sendall(encode_array(["PING"]))
+  read_simple_string_response(connection)
+
+  connection.sendall(encode_array(["REPLCONF", "listening-port", str(listen_port)]))
+  read_simple_string_response(connection)
+
+  connection.sendall(encode_array(["REPLCONF", "capa", "psync2"]))
+  read_simple_string_response(connection)
+
+  connection.sendall(encode_array(["PSYNC", "?", "-1"]))
+  read_simple_string_response(connection)
+  read_bulk_string_response(connection)
+
+  connection.setblocking(False)
+  connection.settimeout(None)
+  master_connection = connection
+  selector.register(connection, selectors.EVENT_READ, read_master)
+
+
+def read_line_blocking(connection):
+  data = b""
+  while b"\r\n" not in data:
+    chunk = connection.recv(1024)
+    if not chunk:
+      raise ConnectionError("Connection closed")
+    data += chunk
+
+  line, remainder = data.split(b"\r\n", 1)
+  connection_buffers[connection] = remainder
+  return line
+
+
+def read_simple_string_response(connection):
+  buffered = connection_buffers.get(connection, b"")
+  if b"\r\n" not in buffered:
+    line = read_line_blocking(connection)
+  else:
+    line, remainder = buffered.split(b"\r\n", 1)
+    connection_buffers[connection] = remainder
+
+  if line[:1] not in (b"+", b"-"):
+    raise ValueError("Unexpected response during handshake")
+
+
+def read_exact_blocking(connection, size):
+  buffered = connection_buffers.get(connection, b"")
+  data = buffered
+  while len(data) < size:
+    chunk = connection.recv(4096)
+    if not chunk:
+      raise ConnectionError("Connection closed")
+    data += chunk
+
+  connection_buffers[connection] = data[size:]
+  return data[:size]
+
+
+def read_bulk_string_response(connection):
+  line = read_line_blocking(connection)
+  if line[:1] != b"$":
+    raise ValueError("Expected bulk response")
+
+  bulk_len = int(line[1:])
+  read_exact_blocking(connection, bulk_len + 2)
+
+
+def replication_info_text():
+  lines = [f"role:{role}"]
+  if role == "master":
+    lines.append(f"master_replid:{master_replid}")
+    lines.append(f"master_repl_offset:{master_repl_offset}")
+  else:
+    lines.append(f"master_host:{master_host}")
+    lines.append(f"master_port:{master_port}")
+    lines.append("master_link_status:up")
+  return "\r\n".join(lines) + "\r\n"
+
+
+def is_write_command(command):
+  return command in {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD"}
+
+
+def propagate_to_replicas(raw_command):
+  global master_repl_offset
+
+  if not replica_connections:
+    return
+
+  master_repl_offset += len(raw_command)
+
+  dead_connections = []
+  for replica_connection in replica_connections:
+    try:
+      replica_connection.sendall(raw_command)
+    except OSError:
+      dead_connections.append(replica_connection)
+
+  for dead_connection in dead_connections:
+    replica_connections.discard(dead_connection)
+    replica_ack_offsets.pop(dead_connection, None)
+
+
+def request_replica_acks():
+  request = encode_array(["REPLCONF", "GETACK", "*"])
+  dead_connections = []
+  for replica_connection in replica_connections:
+    try:
+      replica_connection.sendall(request)
+    except OSError:
+      dead_connections.append(replica_connection)
+
+  for dead_connection in dead_connections:
+    replica_connections.discard(dead_connection)
+    replica_ack_offsets.pop(dead_connection, None)
+
+
+def count_acked_replicas():
+  if master_repl_offset == 0:
+    return len(replica_connections)
+
+  count = 0
+  for replica_connection in replica_connections:
+    if replica_ack_offsets.get(replica_connection, -1) >= master_repl_offset:
+      count += 1
+
+  return count
+
+
+def handle_wait(connection, selector, command_parts):
+  if len(command_parts) < 3:
+    connection.sendall(encode_error("ERR wrong number of arguments for 'WAIT' command"))
+    return
+
+  replicas_needed = int(command_parts[1])
+  timeout_ms = int(command_parts[2])
+
+  if not replica_connections:
+    connection.sendall(encode_integer(0))
+    return
+
+  if count_acked_replicas() >= replicas_needed:
+    connection.sendall(encode_integer(count_acked_replicas()))
+    return
+
+  request_replica_acks()
+  deadline = time.monotonic() + (timeout_ms / 1000)
+
+  while time.monotonic() < deadline:
+    if count_acked_replicas() >= replicas_needed:
+      break
+
+    events = selector.select(timeout=0.01)
+    for key, _ in events:
+      callback = key.data
+      callback(key.fileobj, selector)
+
+    expire_pending_blpop_requests()
+    expire_pending_xread_requests()
+
+  connection.sendall(encode_integer(count_acked_replicas()))
 
 def encode_simple_string(value):
   return f"+{value}\r\n".encode()
@@ -390,6 +681,9 @@ def remove_pending_requests_for_connection(connection):
 
   clear_transaction(connection)
   clear_watched_keys(connection)
+  connection_buffers.pop(connection, None)
+  replica_connections.discard(connection)
+  replica_ack_offsets.pop(connection, None)
 
   index = 0
   while index < len(pending_xread_requests):
@@ -640,6 +934,64 @@ def execute_transaction_queue(connection, selector):
   clear_transaction(connection)
   clear_watched_keys(connection)
   connection.sendall(encode_array(results))
+
+
+def execute_command(connection, selector, command_parts, raw_command=None, send_response=True, from_master=False):
+  command = command_parts[0].upper()
+
+  if command == "REPLCONF":
+    if len(command_parts) >= 3 and command_parts[1].upper() == "GETACK":
+      if role == "slave" and master_connection is not None:
+        ack_payload = encode_array(["REPLCONF", "ACK", str(replica_processed_offset)])
+        try:
+          master_connection.sendall(ack_payload)
+        except OSError:
+          pass
+      if send_response:
+        connection.sendall(encode_simple_string("OK"))
+      return True
+
+    if len(command_parts) >= 3 and command_parts[1].upper() == "ACK":
+      try:
+        replica_ack_offsets[connection] = int(command_parts[2])
+      except ValueError:
+        replica_ack_offsets[connection] = 0
+
+      if send_response:
+        connection.sendall(encode_simple_string("OK"))
+      return True
+
+    if send_response:
+      connection.sendall(encode_simple_string("OK"))
+    return True
+
+  if command == "PSYNC":
+    if send_response:
+      connection.sendall(encode_simple_string(f"FULLRESYNC {master_replid} {master_repl_offset}"))
+      rdb_payload = bytes.fromhex(EMPTY_RDB_HEX)
+      connection.sendall(f"${len(rdb_payload)}\r\n".encode() + rdb_payload + b"\r\n")
+
+    replica_connections.add(connection)
+    replica_ack_offsets[connection] = master_repl_offset
+    return True
+
+  if command == "WAIT":
+    if send_response:
+      handle_wait(connection, selector, command_parts)
+    return True
+
+  if command == "INFO":
+    if len(command_parts) >= 2 and command_parts[1].lower() == "replication":
+      if send_response:
+        connection.sendall(encode_bulk_string(replication_info_text()))
+      return True
+
+  if command == "PING":
+    if send_response:
+      connection.sendall(encode_simple_string("PONG"))
+    return True
+
+  return False
   
 def read_client(connection, selector):
   try:
@@ -651,351 +1003,403 @@ def read_client(connection, selector):
   if not data:
     close_client(connection, selector)
     return
-  
-  command_parts = parse_resp_command(data)
-  if not command_parts:
-    connection.sendall(encode_simple_string("PONG"))
-    return
-  
-  command = command_parts[0].upper()
 
-  if command == "WATCH":
-    if is_transaction_active(connection):
-      connection.sendall(encode_error("ERR WATCH inside MULTI is not allowed"))
-      return
-    watch_keys_for_connection(connection, command_parts[1:])
-    connection.sendall(encode_simple_string("OK"))
-    return
-
-  if command == "UNWATCH":
-    if is_transaction_active(connection):
-      connection.sendall(encode_error("ERR UNWATCH inside MULTI is not allowed"))
-      return
-    clear_watched_keys(connection)
-    connection.sendall(encode_simple_string("OK"))
-    return
-
-  if is_transaction_active(connection):
-    if command == "EXEC":
-      execute_transaction_queue(connection, selector)
+  commands = extract_resp_commands(connection, data)
+  if not commands:
+    command_parts = parse_resp_command(data)
+    if command_parts:
+      commands = [(command_parts, data)]
+    else:
+      connection.sendall(encode_simple_string("PONG"))
       return
 
-    if command == "DISCARD":
-      clear_transaction(connection)
+  for command_parts, raw_command in commands:
+    if not command_parts:
+      continue
+
+    if execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=True):
+      continue
+
+    command = command_parts[0].upper()
+
+    if command == "WATCH":
+      if is_transaction_active(connection):
+        connection.sendall(encode_error("ERR WATCH inside MULTI is not allowed"))
+        continue
+      watch_keys_for_connection(connection, command_parts[1:])
+      connection.sendall(encode_simple_string("OK"))
+      continue
+
+    if command == "UNWATCH":
+      if is_transaction_active(connection):
+        connection.sendall(encode_error("ERR UNWATCH inside MULTI is not allowed"))
+        continue
       clear_watched_keys(connection)
       connection.sendall(encode_simple_string("OK"))
-      return
+      continue
 
-    if command == "MULTI":
-      connection.sendall(encode_error("ERR MULTI calls can not be nested"))
-      return
-
-    get_transaction_queue(connection).append(command_parts)
-    connection.sendall(encode_simple_string("QUEUED"))
-    return
-
-  if command == "MULTI":
-    get_transaction_queue(connection)
-    connection.sendall(encode_simple_string("OK"))
-    return
-
-  if command == "EXEC":
-    connection.sendall(encode_error("ERR EXEC without MULTI"))
-    return
-
-  if command == "DISCARD":
-    connection.sendall(encode_error("ERR DISCARD without MULTI"))
-    return
-  
-  if command == "PING":
-    connection.sendall(encode_simple_string("PONG"))
-    return
-
-  if command == "ECHO" and len(command_parts) >= 2:
-    connection.sendall(encode_bulk_string(command_parts[1]))
-    return
-  
-  if command == "SET" and len(command_parts) >= 3:
-    key = command_parts[1]
-    value = command_parts[2]
-
-    expires_at = None
-    if len(command_parts) >= 5:
-      option = command_parts[3].upper()
-      option_value = command_parts[4]
-
-      if option == "PX":
-        expires_at = time.monotonic() + (int(option_value) / 1000)
-      elif option == "EX":
-        expires_at = time.monotonic() + int(option_value)
-
-    store[key] = make_string_entry(value, expires_at)
-    touch_key(key)
-    connection.sendall(encode_simple_string("OK"))
-    return
-
-  if command == "GET" and len(command_parts) >= 2:
-    key = command_parts[1]
-    connection.sendall(encode_bulk_string(get_value(key)))
-    return
-
-  if command == "INCR" and len(command_parts) >= 2:
-    result = apply_incr(command_parts[1])
-    if isinstance(result, dict) and result.get("type") == "error":
-      connection.sendall(encode_error(result["message"]))
-      return
-
-    connection.sendall(encode_integer(result))
-    return
-  
-  if command == "TYPE" and len(command_parts) >= 2:
-    key = command_parts[1]
-    entry = get_entry(key)
-    
-    if entry is None:
-      connection.sendall(encode_simple_string("none"))
-      return
-    
-    connection.sendall(encode_simple_string(entry["type"]))
-    return
-  
-  if command == "XADD" and len(command_parts) >= 5:
-    key = command_parts[1]
-    id_token = command_parts[2]
-    field_values = command_parts[3:]
-
-    if len(field_values) % 2 != 0:
-      connection.sendall(encode_error("ERR wrong number of arguments for 'XADD' command"))
-      return
-
-    stream_values = get_stream_for_write(key)
-    if stream_values is None:
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
-
-    stream_entry = store[key]
-
-    if id_token == "*":
-      entry_id = generate_stream_id(stream_entry)
-    else:
-      parsed_id = parse_stream_id(id_token)
-      if parsed_id is None:
-        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
-        return
-
-      if parsed_id[1] == "*":
-        requested_ms = parsed_id[0]
-        if requested_ms < stream_entry["last_ms"]:
-          connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
-          return
-
-        entry_id = generate_stream_id(stream_entry, requested_ms=requested_ms)
-      else:
-        if parsed_id <= (0, 0):
-          connection.sendall(encode_error("ERR The ID specified in XADD must be greater than 0-0"))
-          return
-
-        last_stream_id = (0, 0)
-        if stream_values:
-          last_stream_id = parse_stream_id(stream_values[-1]["id"])
-          if last_stream_id is None:
-            connection.sendall(encode_error("ERR Invalid stream state"))
-            return
-
-        if parsed_id <= last_stream_id:
-          connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
-          return
-
-        stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
-        entry_id = id_token
-
-    entry_fields = {}
-    for i in range(0, len(field_values), 2):
-      entry_fields[field_values[i]] = field_values[i + 1]
-
-    stream_values.append({
-      "id": entry_id,
-      "fields": entry_fields,
-    })
-
-    touch_key(key)
-
-    connection.sendall(encode_bulk_string(entry_id))
-    wake_pending_xread_requests()
-    return
-
-  if command == "XRANGE" and len(command_parts) >= 4:
-    key = command_parts[1]
-    min_token = command_parts[2]
-    max_token = command_parts[3]
-
-    entry = get_entry(key)
-    if entry is None:
-      connection.sendall(encode_array([]))
-      return
-
-    if entry["type"] != "stream":
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
-
-    if min_token == "-":
-      min_id = (-1, -1)
-    else:
-      min_id = parse_stream_id(min_token)
-      if min_id is None or min_id == "+":
-        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
-        return
-
-    if max_token == "+":
-      max_id = (10**30, 10**30)
-    else:
-      max_id = parse_stream_id(max_token)
-      if max_id is None or max_id == "-":
-        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
-        return
-
-    result = []
-    for stream_item in entry["value"]:
-      item_id = parse_stream_id(stream_item["id"])
-      if item_id is None:
+    if is_transaction_active(connection):
+      if command == "EXEC":
+        execute_transaction_queue(connection, selector)
         continue
 
-      if min_id <= item_id <= max_id:
-        fields = []
-        for field_name, field_value in stream_item["fields"].items():
-          fields.append(field_name)
-          fields.append(field_value)
+      if command == "DISCARD":
+        clear_transaction(connection)
+        clear_watched_keys(connection)
+        connection.sendall(encode_simple_string("OK"))
+        continue
 
-        result.append([stream_item["id"], fields])
+      if command == "MULTI":
+        connection.sendall(encode_error("ERR MULTI calls can not be nested"))
+        continue
 
-    connection.sendall(encode_array(result))
-    return
+      get_transaction_queue(connection).append(command_parts)
+      connection.sendall(encode_simple_string("QUEUED"))
+      continue
 
-  if command == "XREAD":
-    parsed = parse_xread_command(command_parts)
-    if parsed is None:
-      connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
-      return
+    if command == "MULTI":
+      get_transaction_queue(connection)
+      connection.sendall(encode_simple_string("OK"))
+      continue
 
-    if parsed == "WRONGTYPE":
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
+    if command == "EXEC":
+      connection.sendall(encode_error("ERR EXEC without MULTI"))
+      continue
 
-    response = build_xread_response(parsed["keys"], parsed["cursors"])
-    if response is not None:
-      connection.sendall(encode_array(response))
-      return
-
-    if parsed["block_timeout"] is None:
-      connection.sendall(encode_array(None))
-      return
-
-    deadline = None
-    if parsed["block_timeout"] > 0:
-      deadline = time.monotonic() + (parsed["block_timeout"] / 1000)
-
-    pending_xread_requests.append({
-      "connection": connection,
-      "keys": parsed["keys"],
-      "cursors": parsed["cursors"],
-      "deadline": deadline,
-    })
-    return
+    if command == "DISCARD":
+      connection.sendall(encode_error("ERR DISCARD without MULTI"))
+      continue
     
-  if command == "RPUSH" and len(command_parts) >= 3:
-    key = command_parts[1]
-    values = command_parts[2:]
+    if command == "ECHO" and len(command_parts) >= 2:
+      connection.sendall(encode_bulk_string(command_parts[1]))
+      continue
+    
+    if command == "SET" and len(command_parts) >= 3:
+      key = command_parts[1]
+      value = command_parts[2]
 
-    list_values = get_list_for_write(key)
-    if list_values is None:
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
+      expires_at = None
+      if len(command_parts) >= 5:
+        option = command_parts[3].upper()
+        option_value = command_parts[4]
 
-    list_values.extend(values)
-    touch_key(key)
-    connection.sendall(encode_integer(len(list_values)))
-    wake_pending_blpop_requests()
-    return
+        if option == "PX":
+          expires_at = time.monotonic() + (int(option_value) / 1000)
+        elif option == "EX":
+          expires_at = time.monotonic() + int(option_value)
 
-  if command == "LPUSH" and len(command_parts) >= 3:
-    key = command_parts[1]
-    values = command_parts[2:]
+      store[key] = make_string_entry(value, expires_at)
+      touch_key(key)
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_simple_string("OK"))
+      continue
 
-    list_values = get_list_for_write(key)
-    if list_values is None:
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
+    if command == "GET" and len(command_parts) >= 2:
+      key = command_parts[1]
+      connection.sendall(encode_bulk_string(get_value(key)))
+      continue
 
-    for value in values:
-      list_values.insert(0, value)
+    if command == "INCR" and len(command_parts) >= 2:
+      result = apply_incr(command_parts[1])
+      if isinstance(result, dict) and result.get("type") == "error":
+        connection.sendall(encode_error(result["message"]))
+        continue
 
-    touch_key(key)
-    connection.sendall(encode_integer(len(list_values)))
-    wake_pending_blpop_requests()
-    return
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_integer(result))
+      continue
+    
+    if command == "TYPE" and len(command_parts) >= 2:
+      key = command_parts[1]
+      entry = get_entry(key)
+      
+      if entry is None:
+        connection.sendall(encode_simple_string("none"))
+        continue
+      
+      connection.sendall(encode_simple_string(entry["type"]))
+      continue
+    
+    if command == "XADD" and len(command_parts) >= 5:
+      key = command_parts[1]
+      id_token = command_parts[2]
+      field_values = command_parts[3:]
 
-  if command == "LRANGE" and len(command_parts) >= 4:
-    key = command_parts[1]
-    start = int(command_parts[2])
-    stop = int(command_parts[3])
+      if len(field_values) % 2 != 0:
+        connection.sendall(encode_error("ERR wrong number of arguments for 'XADD' command"))
+        continue
 
-    list_values = get_list_for_read(key)
-    if list_values is None:
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
+      stream_values = get_stream_for_write(key)
+      if stream_values is None:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
 
-    connection.sendall(encode_array(trim_lrange(list_values, start, stop)))
-    return
+      stream_entry = store[key]
 
-  if command == "LLEN" and len(command_parts) >= 2:
-    key = command_parts[1]
-    list_values = get_list_for_read(key)
+      if id_token == "*":
+        entry_id = generate_stream_id(stream_entry)
+      else:
+        parsed_id = parse_stream_id(id_token)
+        if parsed_id is None:
+          connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+          continue
 
-    if list_values is None:
-      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
-      return
+        if parsed_id[1] == "*":
+          requested_ms = parsed_id[0]
+          if requested_ms < stream_entry["last_ms"]:
+            connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+            continue
 
-    connection.sendall(encode_integer(len(list_values)))
-    return
+          entry_id = generate_stream_id(stream_entry, requested_ms=requested_ms)
+        else:
+          if parsed_id <= (0, 0):
+            connection.sendall(encode_error("ERR The ID specified in XADD must be greater than 0-0"))
+            continue
 
-  if command == "LPOP" and len(command_parts) >= 2:
-    key = command_parts[1]
+          last_stream_id = (0, 0)
+          if stream_values:
+            last_stream_id = parse_stream_id(stream_values[-1]["id"])
+            if last_stream_id is None:
+              connection.sendall(encode_error("ERR Invalid stream state"))
+              continue
 
-    if len(command_parts) >= 3:
-      count = int(command_parts[2])
-      popped_items = pop_from_list(key, count)
+          if parsed_id <= last_stream_id:
+            connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+            continue
 
-      if popped_items is None:
+          stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
+          entry_id = id_token
+
+      entry_fields = {}
+      for i in range(0, len(field_values), 2):
+        entry_fields[field_values[i]] = field_values[i + 1]
+
+      stream_values.append({
+        "id": entry_id,
+        "fields": entry_fields,
+      })
+
+      touch_key(key)
+
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_bulk_string(entry_id))
+      wake_pending_xread_requests()
+      continue
+
+    if command == "XRANGE" and len(command_parts) >= 4:
+      key = command_parts[1]
+      min_token = command_parts[2]
+      max_token = command_parts[3]
+
+      entry = get_entry(key)
+      if entry is None:
+        connection.sendall(encode_array([]))
+        continue
+
+      if entry["type"] != "stream":
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      if min_token == "-":
+        min_id = (-1, -1)
+      else:
+        min_id = parse_stream_id(min_token)
+        if min_id is None or min_id == "+":
+          connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+          continue
+
+      if max_token == "+":
+        max_id = (10**30, 10**30)
+      else:
+        max_id = parse_stream_id(max_token)
+        if max_id is None or max_id == "-":
+          connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+          continue
+
+      result = []
+      for stream_item in entry["value"]:
+        item_id = parse_stream_id(stream_item["id"])
+        if item_id is None:
+          continue
+
+        if min_id <= item_id <= max_id:
+          fields = []
+          for field_name, field_value in stream_item["fields"].items():
+            fields.append(field_name)
+            fields.append(field_value)
+
+          result.append([stream_item["id"], fields])
+
+      connection.sendall(encode_array(result))
+      continue
+
+    if command == "XREAD":
+      parsed = parse_xread_command(command_parts)
+      if parsed is None:
+        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+        continue
+
+      if parsed == "WRONGTYPE":
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      response = build_xread_response(parsed["keys"], parsed["cursors"])
+      if response is not None:
+        connection.sendall(encode_array(response))
+        continue
+
+      if parsed["block_timeout"] is None:
         connection.sendall(encode_array(None))
-        return
+        continue
 
-      connection.sendall(encode_array(popped_items))
+      deadline = None
+      if parsed["block_timeout"] > 0:
+        deadline = time.monotonic() + (parsed["block_timeout"] / 1000)
+
+      pending_xread_requests.append({
+        "connection": connection,
+        "keys": parsed["keys"],
+        "cursors": parsed["cursors"],
+        "deadline": deadline,
+      })
+      continue
+      
+    if command == "RPUSH" and len(command_parts) >= 3:
+      key = command_parts[1]
+      values = command_parts[2:]
+
+      list_values = get_list_for_write(key)
+      if list_values is None:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      list_values.extend(values)
+      touch_key(key)
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_integer(len(list_values)))
+      wake_pending_blpop_requests()
+      continue
+
+    if command == "LPUSH" and len(command_parts) >= 3:
+      key = command_parts[1]
+      values = command_parts[2:]
+
+      list_values = get_list_for_write(key)
+      if list_values is None:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      for value in values:
+        list_values.insert(0, value)
+
+      touch_key(key)
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_integer(len(list_values)))
+      wake_pending_blpop_requests()
+      continue
+
+    if command == "LRANGE" and len(command_parts) >= 4:
+      key = command_parts[1]
+      start = int(command_parts[2])
+      stop = int(command_parts[3])
+
+      list_values = get_list_for_read(key)
+      if list_values is None:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      connection.sendall(encode_array(trim_lrange(list_values, start, stop)))
+      continue
+
+    if command == "LLEN" and len(command_parts) >= 2:
+      key = command_parts[1]
+      list_values = get_list_for_read(key)
+
+      if list_values is None:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        continue
+
+      connection.sendall(encode_integer(len(list_values)))
+      continue
+
+    if command == "LPOP" and len(command_parts) >= 2:
+      key = command_parts[1]
+
+      if len(command_parts) >= 3:
+        count = int(command_parts[2])
+        popped_items = pop_from_list(key, count)
+
+        if popped_items is None:
+          connection.sendall(encode_array(None))
+          continue
+
+        if role == "master" and raw_command is not None:
+          propagate_to_replicas(raw_command)
+        connection.sendall(encode_array(popped_items))
+        continue
+
+      popped_item = pop_from_list(key)
+      if popped_item is not None and role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+      connection.sendall(encode_bulk_string(popped_item))
+      continue
+
+    if command == "BLPOP" and len(command_parts) >= 3:
+      keys = command_parts[1:-1]
+      timeout_seconds = float(command_parts[-1])
+      response = try_pop_from_keys(keys)
+      if response is not None:
+        connection.sendall(encode_array(response))
+        continue
+
+      deadline = None
+      if timeout_seconds > 0:
+        deadline = time.monotonic() + timeout_seconds
+
+      pending_blpop_requests.append({
+        "connection": connection,
+        "keys": keys,
+        "deadline": deadline,
+      })
       return
+    connection.sendall(encode_simple_string("OK"))
 
-    popped_item = pop_from_list(key)
-    connection.sendall(encode_bulk_string(popped_item))
+
+def read_master(connection, selector):
+  global replica_processed_offset
+
+  try:
+    data = connection.recv(4096)
+  except ConnectionResetError:
+    close_client(connection, selector)
     return
 
-  if command == "BLPOP" and len(command_parts) >= 3:
-    keys = command_parts[1:-1]
-    timeout_seconds = float(command_parts[-1])
-    response = try_pop_from_keys(keys)
-    if response is not None:
-      connection.sendall(encode_array(response))
-      return
-
-    deadline = None
-    if timeout_seconds > 0:
-      deadline = time.monotonic() + timeout_seconds
-
-    pending_blpop_requests.append({
-      "connection": connection,
-      "keys": keys,
-      "deadline": deadline,
-    })
+  if not data:
+    close_client(connection, selector)
     return
-  
-  connection.sendall(encode_simple_string("OK"))
+
+  commands = extract_resp_commands(connection, data)
+  for command_parts, raw_command in commands:
+    if not command_parts:
+      continue
+
+    command = command_parts[0].upper()
+    if command == "REPLCONF" and len(command_parts) >= 3 and command_parts[1].upper() == "GETACK":
+      ack_payload = encode_array(["REPLCONF", "ACK", str(replica_processed_offset)])
+      try:
+        connection.sendall(ack_payload)
+      except OSError:
+        pass
+      replica_processed_offset += len(raw_command)
+      continue
+
+    execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=False, from_master=True)
+    replica_processed_offset += len(raw_command)
 
 def close_client(connection, selector):
   remove_pending_requests_for_connection(connection)
@@ -1010,12 +1414,19 @@ def close_client(connection, selector):
 def main():
     print("Logs from your program will appear here!")
 
+    global master_replid
+    parse_server_config(sys.argv)
+    master_replid = random_replid()
+
     selector = selectors.DefaultSelector()
     
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=(sys.platform != "win32"))
+    server_socket = socket.create_server(("localhost", listen_port), reuse_port=(sys.platform != "win32"))
     server_socket.setblocking(False)
     
     selector.register(server_socket, selectors.EVENT_READ, accept_connection)
+
+    if role == "slave":
+      connect_to_master_and_handshake(selector)
     
     while True:
       events = selector.select(timeout=get_selector_timeout())
