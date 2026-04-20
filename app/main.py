@@ -682,6 +682,7 @@ def read_client(connection, selector):
 
     if command == "DISCARD":
       clear_transaction(connection)
+      clear_watched_keys(connection)
       connection.sendall(encode_simple_string("OK"))
       return
 
