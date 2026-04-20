@@ -1083,9 +1083,6 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
         replica_ack_offsets[connection] = int(command_parts[2])
       except ValueError:
         replica_ack_offsets[connection] = 0
-
-      if send_response:
-        connection.sendall(encode_simple_string("OK"))
       return True
 
     if send_response:
