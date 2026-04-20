@@ -420,6 +420,53 @@ def read_client(connection, selector):
 
     connection.sendall(encode_bulk_string(entry_id))
     return
+
+  if command == "XRANGE" and len(command_parts) >= 4:
+    key = command_parts[1]
+    min_token = command_parts[2]
+    max_token = command_parts[3]
+
+    entry = get_entry(key)
+    if entry is None:
+      connection.sendall(encode_array([]))
+      return
+
+    if entry["type"] != "stream":
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    if min_token == "-":
+      min_id = (-1, -1)
+    else:
+      min_id = parse_stream_id(min_token)
+      if min_id is None or min_id == "+":
+        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+        return
+
+    if max_token == "+":
+      max_id = (10**30, 10**30)
+    else:
+      max_id = parse_stream_id(max_token)
+      if max_id is None or max_id == "-":
+        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+        return
+
+    result = []
+    for stream_item in entry["value"]:
+      item_id = parse_stream_id(stream_item["id"])
+      if item_id is None:
+        continue
+
+      if min_id <= item_id <= max_id:
+        fields = []
+        for field_name, field_value in stream_item["fields"].items():
+          fields.append(field_name)
+          fields.append(field_value)
+
+        result.append([stream_item["id"], fields])
+
+    connection.sendall(encode_array(result))
+    return
     
   if command == "RPUSH" and len(command_parts) >= 3:
     key = command_parts[1]
