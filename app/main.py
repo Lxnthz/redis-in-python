@@ -189,6 +189,10 @@ def connect_to_master_and_handshake(selector):
   master_connection = connection
   selector.register(connection, selectors.EVENT_READ, read_master)
 
+  buffered_master_commands = extract_resp_commands(connection, b"")
+  if buffered_master_commands:
+    process_master_commands(connection, selector, buffered_master_commands)
+
 
 def read_line_blocking(connection):
   data = connection_buffers.get(connection, b"")
@@ -239,6 +243,30 @@ def read_bulk_string_response(connection):
   buffered = connection_buffers.get(connection, b"")
   if buffered.startswith(b"\r\n"):
     connection_buffers[connection] = buffered[2:]
+
+
+def process_master_commands(connection, selector, commands):
+  global replica_processed_offset
+
+  for command_parts, raw_command in commands:
+    if not command_parts:
+      continue
+
+    command = command_parts[0].upper()
+    if command == "REPLCONF" and len(command_parts) >= 3 and command_parts[1].upper() == "GETACK":
+      ack_payload = encode_array(["REPLCONF", "ACK", str(replica_processed_offset)])
+      try:
+        connection.sendall(ack_payload)
+      except OSError:
+        pass
+      replica_processed_offset += len(raw_command)
+      continue
+
+    was_handled = execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=False, from_master=True)
+    if not was_handled:
+      apply_replicated_write(command_parts)
+
+    replica_processed_offset += len(raw_command)
 
 
 def replication_info_text():
@@ -1470,8 +1498,6 @@ def read_client(connection, selector):
 
 
 def read_master(connection, selector):
-  global replica_processed_offset
-
   try:
     data = connection.recv(4096)
   except ConnectionResetError:
@@ -1483,25 +1509,7 @@ def read_master(connection, selector):
     return
 
   commands = extract_resp_commands(connection, data)
-  for command_parts, raw_command in commands:
-    if not command_parts:
-      continue
-
-    command = command_parts[0].upper()
-    if command == "REPLCONF" and len(command_parts) >= 3 and command_parts[1].upper() == "GETACK":
-      ack_payload = encode_array(["REPLCONF", "ACK", str(replica_processed_offset)])
-      try:
-        connection.sendall(ack_payload)
-      except OSError:
-        pass
-      replica_processed_offset += len(raw_command)
-      continue
-
-    was_handled = execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=False, from_master=True)
-    if not was_handled:
-      apply_replicated_write(command_parts)
-
-    replica_processed_offset += len(raw_command)
+  process_master_commands(connection, selector, commands)
 
 def close_client(connection, selector):
   remove_pending_requests_for_connection(connection)
