@@ -1068,7 +1068,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     if send_response:
       connection.sendall(encode_simple_string(f"FULLRESYNC {master_replid} {master_repl_offset}"))
       rdb_payload = bytes.fromhex(EMPTY_RDB_HEX)
-      connection.sendall(f"${len(rdb_payload)}\r\n".encode() + rdb_payload + b"\r\n")
+      connection.sendall(f"${len(rdb_payload)}\r\n".encode() + rdb_payload)
 
     replica_connections.add(connection)
     replica_ack_offsets[connection] = master_repl_offset
