@@ -262,6 +262,17 @@ def accept_connection(server_socket, selector):
   connection.setblocking(False)
   selector.register(connection, selectors.EVENT_READ, read_client)
   
+def parse_stream_id(stream_id):
+  parts = stream_id.split("-", 1)
+  if len(parts) != 2:
+    return None
+  
+  ms_text, seq_text = parts
+  if not ms_text.isdigit() or not seq_text.isdigit():
+    return None
+  
+  return int(ms_text), int(seq_text)
+  
 def read_client(connection, selector):
   try:
     data = connection.recv(1024)
@@ -325,29 +336,54 @@ def read_client(connection, selector):
   if command == "XADD" and len(command_parts) >= 5:
     key = command_parts[1]
     id_token = command_parts[2]
-    field_value = command_parts[3:]
-    
-    if len(field_value) % 2 != 0:
-      connection.sendall(encode_error("[ERROR] Wrong number of arguments for 'XADD' command"))
+    field_values = command_parts[3:]
+
+    if len(field_values) % 2 != 0:
+      connection.sendall(encode_error("ERR wrong number of arguments for 'XADD' command"))
       return
-    
+
     stream_values = get_stream_for_write(key)
     if stream_values is None:
-      connection.sendall(encode_error("[ERROR] Wrong type of value for 'XADD' command"))
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
       return
 
     stream_entry = store[key]
-    entry_id = generate_stream_id(stream_entry) if id_token == "*" else id_token
-    
+
+    if id_token == "*":
+      entry_id = generate_stream_id(stream_entry)
+    else:
+      parsed_id = parse_stream_id(id_token)
+      if parsed_id is None:
+        connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+        return
+
+      if parsed_id <= (0, 0):
+        connection.sendall(encode_error("ERR The ID specified in XADD must be greater than 0-0"))
+        return
+
+      last_stream_id = (0, 0)
+      if stream_values:
+        last_stream_id = parse_stream_id(stream_values[-1]["id"])
+        if last_stream_id is None:
+          connection.sendall(encode_error("ERR Invalid stream state"))
+          return
+
+      if parsed_id <= last_stream_id:
+        connection.sendall(encode_error("ERR The ID specified in XADD must be greater than the target stream top item"))
+        return
+
+      stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
+      entry_id = id_token
+
     entry_fields = {}
-    for i in range(0, len(field_value), 2):
-      entry_fields[field_value[i]] = field_value[i + 1]
-      
+    for i in range(0, len(field_values), 2):
+      entry_fields[field_values[i]] = field_values[i + 1]
+
     stream_values.append({
       "id": entry_id,
       "fields": entry_fields,
     })
-    
+
     connection.sendall(encode_bulk_string(entry_id))
     return
     
