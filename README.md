@@ -185,3 +185,39 @@ Chapter 4 added Redis-style transactions so multiple commands can be queued and 
 11. Multiple transactions
 
     I kept transaction state isolated per connection in [transaction_commands](app/main.py), so different clients can use `MULTI`/`EXEC` independently. This allows multiple active transactions without one client interfering with another.
+
+## Chapter 5 - Optimistic Locking
+
+Chapter 5 added optimistic locking support so transactions can be safely retried when watched keys change, enabling conflict detection without blocking locks.
+
+1. The WATCH command
+
+   I implemented [WATCH](app/main.py) to start monitoring one or more keys for changes. When `WATCH` is called, I snapshot the current version of each key in [watch_keys_for_connection()](app/main.py) and store the per-connection watch state in [watched_keys](app/main.py). This lets the client set up a watch before starting a transaction.
+
+2. WATCH inside transaction
+
+   I added a check in [the WATCH handler](app/main.py) to reject `WATCH` if a transaction is already active on that connection. This matches Redis behavior where `WATCH` must be called before `MULTI`, not inside the transaction. The command returns an error if attempted inside a transaction.
+
+3. Tracking key modifications
+
+   I introduced a global [key_versions](app/main.py) dictionary that tracks a version counter for every key. Whenever a key is modified (via `SET`, `INCR`, `XADD`, `RPUSH`, `LPUSH`, `LPOP`, or expiry), I call [touch_key()](app/main.py) to increment its version. This leaves a timestamp of when each key was last written.
+
+4. Watching multiple keys
+
+   I extended [WATCH](app/main.py) to accept multiple key arguments in a single command. The implementation stores all watched keys and their versions together in the connection's watch dictionary, so a single `WATCH` call can protect multiple keys from concurrent modification.
+
+5. Watching missing keys
+
+   I allow [WATCH](app/main.py) to snapshot keys that don't exist yet by calling [get_key_version()](app/main.py), which initializes missing keys with version 0. This lets the client watch for the creation of a key that might not exist initially, which is useful for implementing optimistic locking patterns on newly created data.
+
+6. The UNWATCH command
+
+   I implemented [UNWATCH](app/main.py) to clear all watched keys for a connection. This is called in [clear_watched_keys()](app/main.py) and is useful if the client wants to abandon a watch or start fresh with a different set of keys.
+
+7. Unwatch on EXEC
+
+   I added a call to [clear_watched_keys()](app/main.py) inside [execute_transaction_queue()](app/main.py) after a transaction executes successfully. This ensures that all watches are automatically cleared after `EXEC` completes, whether the transaction succeeded or was aborted due to a conflict.
+
+8. Unwatch on DISCARD
+
+   I extended [the DISCARD handler](app/main.py) to call [clear_watched_keys()](app/main.py) when a transaction is discarded. This ensures that abandoning a transaction also clears its watches, so subsequent transactions don't inherit stale watch state. Additionally, watches are cleared on connection close in [close_client()](app/main.py) to prevent watch leaks.
