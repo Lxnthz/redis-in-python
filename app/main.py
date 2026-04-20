@@ -49,13 +49,26 @@ def encode_error(message):
 
 
 def encode_array(values):
-  if values is None:
-    return b"*-1\r\n"
+  return encode_resp(values)
 
-  response = f"*{len(values)}\r\n".encode()
-  for value in values:
-    response += encode_bulk_string(value)
-  return response
+
+def encode_resp(value):
+  if value is None:
+    return b"$-1\r\n"
+
+  if isinstance(value, int):
+    return encode_integer(value)
+
+  if isinstance(value, str):
+    return encode_bulk_string(value)
+
+  if isinstance(value, list):
+    response = f"*{len(value)}\r\n".encode()
+    for item in value:
+      response += encode_resp(item)
+    return response
+
+  raise TypeError(f"Unsupported RESP value: {type(value)!r}")
 
 
 def make_string_entry(value, expires_at=None):
@@ -127,15 +140,16 @@ def get_stream_for_write(key):
   
   return entry["value"]
 
-def generate_stream_id(entry):
-  current_ms = int(time.time() * 1000)
-  
-  if entry["last_ms"] == current_ms:
+def generate_stream_id(entry, requested_ms=None):
+  current_ms = int(time.time() * 1000) if requested_ms is None else requested_ms
+  current_ms = max(current_ms, entry["last_ms"])
+
+  if current_ms == entry["last_ms"]:
     entry["last_seq"] += 1
   else:
     entry["last_ms"] = current_ms
     entry["last_seq"] = 0
-  
+
   return f"{entry['last_ms']}-{entry['last_seq']}"
 
 def get_list_for_read(key):
@@ -263,14 +277,23 @@ def accept_connection(server_socket, selector):
   selector.register(connection, selectors.EVENT_READ, read_client)
   
 def parse_stream_id(stream_id):
+  if stream_id in ("-", "+"):
+    return stream_id
+
   parts = stream_id.split("-", 1)
   if len(parts) != 2:
     return None
-  
+
   ms_text, seq_text = parts
-  if not ms_text.isdigit() or not seq_text.isdigit():
+  if not ms_text.isdigit():
     return None
-  
+
+  if seq_text == "*":
+    return int(ms_text), "*"
+
+  if not seq_text.isdigit():
+    return None
+
   return int(ms_text), int(seq_text)
   
 def read_client(connection, selector):
@@ -357,23 +380,31 @@ def read_client(connection, selector):
         connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
         return
 
-      if parsed_id <= (0, 0):
-        connection.sendall(encode_error("ERR The ID specified in XADD must be greater than 0-0"))
-        return
-
-      last_stream_id = (0, 0)
-      if stream_values:
-        last_stream_id = parse_stream_id(stream_values[-1]["id"])
-        if last_stream_id is None:
-          connection.sendall(encode_error("ERR Invalid stream state"))
+      if parsed_id[1] == "*":
+        requested_ms = parsed_id[0]
+        if requested_ms < stream_entry["last_ms"]:
+          connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
           return
 
-      if parsed_id <= last_stream_id:
-        connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
-        return
+        entry_id = generate_stream_id(stream_entry, requested_ms=requested_ms)
+      else:
+        if parsed_id <= (0, 0):
+          connection.sendall(encode_error("ERR The ID specified in XADD must be greater than 0-0"))
+          return
 
-      stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
-      entry_id = id_token
+        last_stream_id = (0, 0)
+        if stream_values:
+          last_stream_id = parse_stream_id(stream_values[-1]["id"])
+          if last_stream_id is None:
+            connection.sendall(encode_error("ERR Invalid stream state"))
+            return
+
+        if parsed_id <= last_stream_id:
+          connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+          return
+
+        stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
+        entry_id = id_token
 
     entry_fields = {}
     for i in range(0, len(field_values), 2):
