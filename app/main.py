@@ -64,6 +64,9 @@ def encode_resp(value):
   if isinstance(value, dict) and value.get("type") == "error":
     return encode_error(value["message"])
 
+  if isinstance(value, dict) and value.get("type") == "simple":
+    return encode_simple_string(value["value"])
+
   if isinstance(value, int):
     return encode_integer(value)
 
@@ -129,6 +132,10 @@ def get_value(key):
 
 def make_error_value(message):
   return {"type": "error", "message": message}
+
+
+def make_simple_value(value):
+  return {"type": "simple", "value": value}
 
 
 def get_list_for_write(key):
@@ -313,7 +320,7 @@ def execute_transaction_command(command_parts):
         expires_at = time.monotonic() + int(option_value)
 
     store[key] = make_string_entry(value, expires_at)
-    return "OK"
+    return make_simple_value("OK")
 
   if command == "TYPE" and len(command_parts) >= 2:
     entry = get_entry(command_parts[1])
