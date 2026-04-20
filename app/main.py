@@ -369,7 +369,7 @@ def read_client(connection, selector):
           return
 
       if parsed_id <= last_stream_id:
-        connection.sendall(encode_error("ERR The ID specified in XADD must be greater than the target stream top item"))
+        connection.sendall(encode_error("ERR The ID specified in XADD is equal or smaller than the target stream top item"))
         return
 
       stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
