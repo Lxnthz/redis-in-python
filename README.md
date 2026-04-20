@@ -137,3 +137,51 @@ Chapter 3 extended the server with Redis Streams support, including stream creat
 13. Blocking reads using $
 
     I supported `$` cursors in [XREAD](app/main.py) so blocking consumers can wait for entries that arrive after the current stream tail. This makes the consumer start from the latest known position and only receive future updates.
+
+## Chapter 4 - Transactions
+
+Chapter 4 added Redis-style transactions so multiple commands can be queued and executed atomically from the client perspective.
+
+1. Key exists and has a numerical value INCR
+
+   I implemented [INCR](app/main.py) so existing numeric string values are parsed, incremented, and stored back as strings. This keeps the counter behavior aligned with Redis while still using the in-memory store.
+
+2. Key doesn't exist INCR
+
+   I made [INCR](app/main.py) create a missing key with value `1` and return the incremented integer reply. That gives the command the expected counter initialization behavior.
+
+3. Key exists but doesn't have a numerical value INCR
+
+   I added integer parsing checks in [the INCR handler](app/main.py), so non-numeric strings return an error instead of being coerced. This preserves Redis's strict numeric semantics.
+
+4. The MULTI command
+
+   I introduced [MULTI](app/main.py) to begin a transaction for a connection and switch subsequent commands into queued mode. The server now tracks transaction state per client connection.
+
+5. The EXEC command
+
+   I implemented [EXEC](app/main.py) so queued commands are replayed in order and returned as a RESP array. Each queued command is executed against the shared in-memory state when the transaction is committed.
+
+6. Empty transaction
+
+   I handled empty transaction execution in [EXEC](app/main.py), which returns an empty RESP array when no commands were queued. That keeps the transaction boundary behavior predictable.
+
+7. Queueing commands
+
+   I made commands entered after [MULTI](app/main.py) return `QUEUED` instead of executing immediately. This lets the client build up a batch before committing it with `EXEC`.
+
+8. Executing a transaction
+
+   I added queued-command execution in [execute_transaction_queue()](app/main.py), which runs each stored command in order and serializes the results as one transaction reply. The implementation preserves response types such as simple strings, integers, bulk strings, and errors.
+
+9. The DISCARD command
+
+   I implemented [DISCARD](app/main.py) to cancel the current transaction and clear any queued commands for that connection. This lets a client abandon a transaction cleanly before execution.
+
+10. Failures within transactions
+
+    I preserved command failures inside [EXEC](app/main.py) as error entries in the returned array rather than aborting the whole transaction. That matches the expected Redis behavior where a failing command still occupies its slot in the result list.
+
+11. Multiple transactions
+
+    I kept transaction state isolated per connection in [transaction_commands](app/main.py), so different clients can use `MULTI`/`EXEC` independently. This allows multiple active transactions without one client interfering with another.

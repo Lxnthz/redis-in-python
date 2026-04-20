@@ -4,9 +4,11 @@ import sys
 import time
 
 store = {}
+key_versions = {}
 pending_blpop_requests = []
 pending_xread_requests = []
 transaction_commands = {}
+watched_keys = {}
 
 def parse_resp_command(data):
   parts = data.split(b"\r\n")
@@ -113,10 +115,20 @@ def get_entry(key):
 
   expires_at = entry["expires_at"]
   if expires_at is not None and time.monotonic() >= expires_at:
+    touch_key(key)
     del store[key]
     return None
 
   return entry
+
+
+def touch_key(key):
+  key_versions[key] = key_versions.get(key, 0) + 1
+
+
+def get_key_version(key):
+  get_entry(key)
+  return key_versions.get(key, 0)
 
 
 def get_value(key):
@@ -138,10 +150,33 @@ def make_simple_value(value):
   return {"type": "simple", "value": value}
 
 
+def watch_keys_for_connection(connection, keys):
+  watched = watched_keys.setdefault(connection, {})
+  for key in keys:
+    watched[key] = get_key_version(key)
+
+
+def clear_watched_keys(connection):
+  watched_keys.pop(connection, None)
+
+
+def transaction_is_dirty(connection):
+  watched = watched_keys.get(connection)
+  if not watched:
+    return False
+
+  for key, version in watched.items():
+    if get_key_version(key) != version:
+      return True
+
+  return False
+
+
 def get_list_for_write(key):
   entry = get_entry(key)
   if entry is None:
     store[key] = make_list_entry()
+    touch_key(key)
     return store[key]["value"]
 
   if entry["type"] != "list":
@@ -153,6 +188,7 @@ def get_stream_for_write(key):
   entry = get_entry(key)
   if entry is None:
     store[key] = make_stream_entry()
+    touch_key(key)
     return store[key]["value"]
   
   if entry["type"] != "stream":
@@ -281,6 +317,7 @@ def apply_incr(key):
   entry = get_entry(key)
   if entry is None:
     store[key] = make_string_entry("1")
+    touch_key(key)
     return 1
 
   if entry["type"] != "string":
@@ -293,6 +330,7 @@ def apply_incr(key):
 
   current_value += 1
   entry["value"] = str(current_value)
+  touch_key(key)
   return current_value
 
 
@@ -320,17 +358,18 @@ def execute_transaction_command(command_parts):
         expires_at = time.monotonic() + int(option_value)
 
     store[key] = make_string_entry(value, expires_at)
+    touch_key(key)
     return make_simple_value("OK")
 
   if command == "TYPE" and len(command_parts) >= 2:
     entry = get_entry(command_parts[1])
     if entry is None:
-      return "none"
+      return make_simple_value("none")
 
-    return entry["type"]
+    return make_simple_value(entry["type"])
 
   if command == "PING":
-    return "PONG"
+    return make_simple_value("PONG")
 
   if command == "ECHO" and len(command_parts) >= 2:
     return command_parts[1]
@@ -350,6 +389,7 @@ def remove_pending_requests_for_connection(connection):
 
 
   clear_transaction(connection)
+  clear_watched_keys(connection)
 
   index = 0
   while index < len(pending_xread_requests):
@@ -397,6 +437,7 @@ def pop_from_list(key, count=None):
 
   if count is None:
     popped = list_values.pop(0)
+    touch_key(key)
     if len(list_values) == 0:
       del store[key]
     return popped
@@ -405,6 +446,8 @@ def pop_from_list(key, count=None):
   pop_count = min(count, len(list_values))
   for _ in range(pop_count):
     popped_items.append(list_values.pop(0))
+
+  touch_key(key)
 
   if len(list_values) == 0:
     del store[key]
@@ -582,6 +625,12 @@ def parse_xread_command(command_parts):
 
 
 def execute_transaction_queue(connection, selector):
+  if transaction_is_dirty(connection):
+    clear_transaction(connection)
+    clear_watched_keys(connection)
+    connection.sendall(encode_array(None))
+    return
+
   queued_commands = transaction_commands.get(connection, [])
   results = []
 
@@ -589,6 +638,7 @@ def execute_transaction_queue(connection, selector):
     results.append(execute_transaction_command(queued_command))
 
   clear_transaction(connection)
+  clear_watched_keys(connection)
   connection.sendall(encode_array(results))
   
 def read_client(connection, selector):
@@ -608,6 +658,16 @@ def read_client(connection, selector):
     return
   
   command = command_parts[0].upper()
+
+  if command == "WATCH":
+    watch_keys_for_connection(connection, command_parts[1:])
+    connection.sendall(encode_simple_string("OK"))
+    return
+
+  if command == "UNWATCH":
+    clear_watched_keys(connection)
+    connection.sendall(encode_simple_string("OK"))
+    return
 
   if is_transaction_active(connection):
     if command == "EXEC":
@@ -663,6 +723,7 @@ def read_client(connection, selector):
         expires_at = time.monotonic() + int(option_value)
 
     store[key] = make_string_entry(value, expires_at)
+    touch_key(key)
     connection.sendall(encode_simple_string("OK"))
     return
 
@@ -749,6 +810,8 @@ def read_client(connection, selector):
       "id": entry_id,
       "fields": entry_fields,
     })
+
+    touch_key(key)
 
     connection.sendall(encode_bulk_string(entry_id))
     wake_pending_xread_requests()
@@ -842,6 +905,7 @@ def read_client(connection, selector):
       return
 
     list_values.extend(values)
+    touch_key(key)
     connection.sendall(encode_integer(len(list_values)))
     wake_pending_blpop_requests()
     return
@@ -858,6 +922,7 @@ def read_client(connection, selector):
     for value in values:
       list_values.insert(0, value)
 
+    touch_key(key)
     connection.sendall(encode_integer(len(list_values)))
     wake_pending_blpop_requests()
     return
