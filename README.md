@@ -80,4 +80,4 @@ Chapter 1 focused on turning a raw socket server into a small Redis-like server 
 
 10. Blocking retrieval with timeout
 
-    I implemented [BLPOP](app/main.py#L273-L278) with a polling loop in [blpop()](app/main.py#L141-L157). The loop checks keys in order, returns as soon as one value is available, and respects finite or infinite timeouts.
+    I implemented [BLPOP](app/main.py) as a non-blocking wait flow: [read_client()](app/main.py) first tries to pop immediately, then stores the request in a pending queue when no values are available. New pushes wake waiting clients through [wake_pending_blpop_requests()](app/main.py), and timed waits are completed by [expire_pending_blpop_requests()](app/main.py) from the main event loop. This keeps the server responsive to concurrent clients while still supporting blocking list retrieval.

@@ -1,5 +1,6 @@
 import socket  # noqa: F401
 import selectors  # noqa: F401
+import sys
 import time
 
 store = {}
@@ -276,6 +277,17 @@ def read_client(connection, selector):
     key = command_parts[1]
     connection.sendall(encode_bulk_string(get_value(key)))
     return
+  
+  if command == "TYPE" and len(command_parts) >= 2:
+    key = command_parts[1]
+    entry = get_entry(key)
+    
+    if entry is None:
+      connection.sendall(encode_simple_string("none"))
+      return
+    
+    connection.sendall(encode_simple_string(entry["type"]))
+    return
 
   if command == "RPUSH" and len(command_parts) >= 3:
     key = command_parts[1]
@@ -392,7 +404,7 @@ def main():
 
     selector = selectors.DefaultSelector()
     
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
+    server_socket = socket.create_server(("localhost", 6379), reuse_port=(sys.platform != "win32"))
     server_socket.setblocking(False)
     
     selector.register(server_socket, selectors.EVENT_READ, accept_connection)
