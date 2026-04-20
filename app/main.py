@@ -104,6 +104,39 @@ def get_list_for_write(key):
 
   return entry["value"]
 
+def make_stream_entry(values=None, last_ms=0, last_seq=0):
+  if values is None:
+    values = []
+  
+  return {
+    "type": "stream",
+    "value": values,
+    "expires_at": None,
+    "last_ms": last_ms,
+    "last_seq": last_seq,
+  }
+  
+def get_stream_for_write(key):
+  entry = get_entry(key)
+  if entry is None:
+    store[key] = make_stream_entry()
+    return store[key]["value"]
+  
+  if entry["type"] != "stream":
+    return None
+  
+  return entry["value"]
+
+def generate_stream_id(entry):
+  current_ms = int(time.time() * 1000)
+  
+  if entry["last_ms"] == current_ms:
+    entry["last_seq"] += 1
+  else:
+    entry["last_ms"] = current_ms
+    entry["last_seq"] = 0
+  
+  return f"{entry['last_ms']}-{entry['last_seq']}"
 
 def get_list_for_read(key):
   entry = get_entry(key)
@@ -288,7 +321,36 @@ def read_client(connection, selector):
     
     connection.sendall(encode_simple_string(entry["type"]))
     return
+  
+  if command == "XADD" and len(command_parts) >= 5:
+    key = command_parts[1]
+    id_token = command_parts[2]
+    field_value = command_parts[3:]
+    
+    if len(field_value) % 2 != 0:
+      connection.sendall(encode_error("[ERROR] Wrong number of arguments for 'XADD' command"))
+      return
+    
+    stream_values = get_stream_for_write(key)
+    if stream_values is None:
+      connection.sendall(encode_error("[ERROR] Wrong type of value for 'XADD' command"))
+      return
 
+    stream_entry = store[key]
+    entry_id = generate_stream_id(stream_entry) if id_token == "*" else id_token
+    
+    entry_fields = {}
+    for i in range(0, len(field_value), 2):
+      entry_fields[field_value[i]] = field_value[i + 1]
+      
+    stream_values.append({
+      "id": entry_id,
+      "fields": entry_fields,
+    })
+    
+    connection.sendall(encode_bulk_string(entry_id))
+    return
+    
   if command == "RPUSH" and len(command_parts) >= 3:
     key = command_parts[1]
     values = command_parts[2:]
