@@ -660,11 +660,17 @@ def read_client(connection, selector):
   command = command_parts[0].upper()
 
   if command == "WATCH":
+    if is_transaction_active(connection):
+      connection.sendall(encode_error("ERR WATCH inside MULTI is not allowed"))
+      return
     watch_keys_for_connection(connection, command_parts[1:])
     connection.sendall(encode_simple_string("OK"))
     return
 
   if command == "UNWATCH":
+    if is_transaction_active(connection):
+      connection.sendall(encode_error("ERR UNWATCH inside MULTI is not allowed"))
+      return
     clear_watched_keys(connection)
     connection.sendall(encode_simple_string("OK"))
     return
