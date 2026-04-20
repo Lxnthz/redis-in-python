@@ -105,6 +105,9 @@ def extract_resp_commands(connection, data):
   offset = 0
 
   while offset < len(buffer):
+    while offset + 1 < len(buffer) and buffer[offset:offset + 2] == b"\r\n":
+      offset += 2
+
     parsed = parse_resp_array_message(buffer, offset)
     if parsed is None:
       break
@@ -139,13 +142,16 @@ def parse_server_config(argv):
       if len(host_port) == 2:
         master_host = host_port[0]
         master_port = int(host_port[1])
+        index += 2
       elif index + 2 < len(argv):
         master_host = argv[index + 1]
         master_port = int(argv[index + 2])
+        index += 3
+      else:
         index += 1
+        continue
 
       role = "slave"
-      index += 2
       continue
 
     index += 1
@@ -185,7 +191,7 @@ def connect_to_master_and_handshake(selector):
 
 
 def read_line_blocking(connection):
-  data = b""
+  data = connection_buffers.get(connection, b"")
   while b"\r\n" not in data:
     chunk = connection.recv(1024)
     if not chunk:
@@ -228,7 +234,11 @@ def read_bulk_string_response(connection):
     raise ValueError("Expected bulk response")
 
   bulk_len = int(line[1:])
-  read_exact_blocking(connection, bulk_len + 2)
+  read_exact_blocking(connection, bulk_len)
+
+  buffered = connection_buffers.get(connection, b"")
+  if buffered.startswith(b"\r\n"):
+    connection_buffers[connection] = buffered[2:]
 
 
 def replication_info_text():
@@ -936,6 +946,95 @@ def execute_transaction_queue(connection, selector):
   connection.sendall(encode_array(results))
 
 
+def apply_replicated_write(command_parts):
+  command = command_parts[0].upper()
+
+  if command == "SET" and len(command_parts) >= 3:
+    key = command_parts[1]
+    value = command_parts[2]
+
+    expires_at = None
+    if len(command_parts) >= 5:
+      option = command_parts[3].upper()
+      option_value = command_parts[4]
+
+      if option == "PX":
+        expires_at = time.monotonic() + (int(option_value) / 1000)
+      elif option == "EX":
+        expires_at = time.monotonic() + int(option_value)
+
+    store[key] = make_string_entry(value, expires_at)
+    touch_key(key)
+    return
+
+  if command == "INCR" and len(command_parts) >= 2:
+    apply_incr(command_parts[1])
+    return
+
+  if command == "RPUSH" and len(command_parts) >= 3:
+    key = command_parts[1]
+    values = command_parts[2:]
+    list_values = get_list_for_write(key)
+    if list_values is not None:
+      list_values.extend(values)
+      touch_key(key)
+    return
+
+  if command == "LPUSH" and len(command_parts) >= 3:
+    key = command_parts[1]
+    values = command_parts[2:]
+    list_values = get_list_for_write(key)
+    if list_values is not None:
+      for value in values:
+        list_values.insert(0, value)
+      touch_key(key)
+    return
+
+  if command == "LPOP" and len(command_parts) >= 2:
+    key = command_parts[1]
+    if len(command_parts) >= 3:
+      pop_count = int(command_parts[2])
+      pop_from_list(key, pop_count)
+      return
+
+    pop_from_list(key)
+    return
+
+  if command == "XADD" and len(command_parts) >= 5:
+    key = command_parts[1]
+    id_token = command_parts[2]
+    field_values = command_parts[3:]
+    if len(field_values) % 2 != 0:
+      return
+
+    stream_values = get_stream_for_write(key)
+    if stream_values is None:
+      return
+
+    stream_entry = store[key]
+
+    if id_token == "*":
+      entry_id = generate_stream_id(stream_entry)
+    else:
+      parsed_id = parse_stream_id(id_token)
+      if parsed_id is None:
+        return
+
+      if parsed_id[1] == "*":
+        entry_id = generate_stream_id(stream_entry, requested_ms=parsed_id[0])
+      else:
+        stream_entry["last_ms"], stream_entry["last_seq"] = parsed_id
+        entry_id = id_token
+
+    entry_fields = {}
+    for i in range(0, len(field_values), 2):
+      entry_fields[field_values[i]] = field_values[i + 1]
+
+    stream_values.append({"id": entry_id, "fields": entry_fields})
+    touch_key(key)
+    return
+
+
 def execute_command(connection, selector, command_parts, raw_command=None, send_response=True, from_master=False):
   command = command_parts[0].upper()
 
@@ -1398,7 +1497,10 @@ def read_master(connection, selector):
       replica_processed_offset += len(raw_command)
       continue
 
-    execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=False, from_master=True)
+    was_handled = execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=False, from_master=True)
+    if not was_handled:
+      apply_replicated_write(command_parts)
+
     replica_processed_offset += len(raw_command)
 
 def close_client(connection, selector):
