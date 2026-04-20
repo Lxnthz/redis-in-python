@@ -49,6 +49,9 @@ def encode_error(message):
 
 
 def encode_array(values):
+  if values is None:
+    return b"*-1\r\n"
+
   return encode_resp(values)
 
 
