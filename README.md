@@ -8,7 +8,7 @@ Redis is an in-memory data structure store used as a high-performance database, 
 
 In this project, I'm rebuilding the idea using 100% Python.
 
-## Chapter 1
+## Chapter 1 - Basics
 
 Chapter 1 focused on turning a raw socket server into a small Redis-like server that can accept connections, parse RESP commands, and store values in memory.
 

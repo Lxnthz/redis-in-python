@@ -5,6 +5,7 @@ import time
 
 store = {}
 pending_blpop_requests = []
+pending_xread_requests = []
 
 def parse_resp_command(data):
   parts = data.split(b"\r\n")
@@ -85,6 +86,19 @@ def make_list_entry(values=None):
   return {"type": "list", "value": values, "expires_at": None}
 
 
+def make_stream_entry(values=None, last_ms=0, last_seq=0):
+  if values is None:
+    values = []
+  
+  return {
+    "type": "stream",
+    "value": values,
+    "expires_at": None,
+    "last_ms": last_ms,
+    "last_seq": last_seq,
+  }
+
+
 def get_entry(key):
   entry = store.get(key)
   if entry is None:
@@ -120,18 +134,6 @@ def get_list_for_write(key):
 
   return entry["value"]
 
-def make_stream_entry(values=None, last_ms=0, last_seq=0):
-  if values is None:
-    values = []
-  
-  return {
-    "type": "stream",
-    "value": values,
-    "expires_at": None,
-    "last_ms": last_ms,
-    "last_seq": last_seq,
-  }
-  
 def get_stream_for_write(key):
   entry = get_entry(key)
   if entry is None:
@@ -142,6 +144,17 @@ def get_stream_for_write(key):
     return None
   
   return entry["value"]
+
+
+  def get_stream_for_read(key):
+    entry = get_entry(key)
+    if entry is None:
+      return []
+
+    if entry["type"] != "stream":
+      return None
+
+    return entry["value"]
 
 def generate_stream_id(entry, requested_ms=None):
   current_ms = int(time.time() * 1000) if requested_ms is None else requested_ms
@@ -154,6 +167,107 @@ def generate_stream_id(entry, requested_ms=None):
     entry["last_seq"] = 0
 
   return f"{entry['last_ms']}-{entry['last_seq']}"
+
+
+def get_stream_last_id(stream_values):
+  if not stream_values:
+    return None
+
+  return parse_stream_id(stream_values[-1]["id"])
+
+
+def build_stream_entries(stream_values, cursor_id):
+  entries = []
+
+  for stream_item in stream_values:
+    item_id = parse_stream_id(stream_item["id"])
+    if item_id is None:
+      continue
+
+    if cursor_id is None or item_id > cursor_id:
+      fields = []
+      for field_name, field_value in stream_item["fields"].items():
+        fields.append(field_name)
+        fields.append(field_value)
+
+      entries.append([stream_item["id"], fields])
+
+  return entries
+
+
+def build_xread_response(keys, cursors):
+  response = []
+
+  for key, cursor_id in zip(keys, cursors):
+    entry = get_entry(key)
+    if entry is None:
+      continue
+
+    if entry["type"] != "stream":
+      return "WRONGTYPE"
+
+    stream_entries = build_stream_entries(entry["value"], cursor_id)
+    if stream_entries:
+      response.append([key, stream_entries])
+
+  if not response:
+    return None
+
+  return response
+
+
+def resolve_xread_cursor(key, token):
+  if token != "$":
+    parsed_id = parse_stream_id(token)
+    if parsed_id is None or parsed_id in ("-", "+"):
+      return None
+
+    return parsed_id
+
+  entry = get_entry(key)
+  if entry is None:
+    return None
+
+  if entry["type"] != "stream":
+    return "WRONGTYPE"
+
+  return get_stream_last_id(entry["value"])
+
+
+def get_pending_request_deadlines():
+  deadlines = []
+
+  for request in pending_blpop_requests:
+    deadline = request["deadline"]
+    if deadline is not None:
+      deadlines.append(deadline)
+
+  for request in pending_xread_requests:
+    deadline = request["deadline"]
+    if deadline is not None:
+      deadlines.append(deadline)
+
+  return deadlines
+
+
+def remove_pending_requests_for_connection(connection):
+  index = 0
+  while index < len(pending_blpop_requests):
+    request = pending_blpop_requests[index]
+    if request["connection"] == connection:
+      pending_blpop_requests.pop(index)
+      continue
+
+    index += 1
+
+  index = 0
+  while index < len(pending_xread_requests):
+    request = pending_xread_requests[index]
+    if request["connection"] == connection:
+      pending_xread_requests.pop(index)
+      continue
+
+    index += 1
 
 def get_list_for_read(key):
   entry = get_entry(key)
@@ -235,6 +349,32 @@ def wake_pending_blpop_requests():
     pending_blpop_requests.pop(index)
 
 
+def wake_pending_xread_requests():
+  index = 0
+  while index < len(pending_xread_requests):
+    request = pending_xread_requests[index]
+    response = build_xread_response(request["keys"], request["cursors"])
+
+    if response is None:
+      index += 1
+      continue
+
+    if response == "WRONGTYPE":
+      try:
+        request["connection"].sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      except OSError:
+        pass
+      pending_xread_requests.pop(index)
+      continue
+
+    try:
+      request["connection"].sendall(encode_array(response))
+    except OSError:
+      pass
+
+    pending_xread_requests.pop(index)
+
+
 def expire_pending_blpop_requests():
   now = time.monotonic()
 
@@ -256,22 +396,32 @@ def expire_pending_blpop_requests():
     pending_blpop_requests.pop(index)
 
 
-def get_selector_timeout():
-  if not pending_blpop_requests:
-    return None
+def expire_pending_xread_requests():
+  now = time.monotonic()
 
-  nearest_deadline = None
-  for request in pending_blpop_requests:
+  index = 0
+  while index < len(pending_xread_requests):
+    request = pending_xread_requests[index]
     deadline = request["deadline"]
-    if deadline is None:
+
+    if deadline is None or now < deadline:
+      index += 1
       continue
 
-    if nearest_deadline is None or deadline < nearest_deadline:
-      nearest_deadline = deadline
+    try:
+      request["connection"].sendall(encode_array(None))
+    except OSError:
+      pass
 
-  if nearest_deadline is None:
+    pending_xread_requests.pop(index)
+
+
+def get_selector_timeout():
+  deadlines = get_pending_request_deadlines()
+  if not deadlines:
     return None
 
+  nearest_deadline = min(deadlines)
   return max(0, nearest_deadline - time.monotonic())
 
 def accept_connection(server_socket, selector):
@@ -298,6 +448,46 @@ def parse_stream_id(stream_id):
     return None
 
   return int(ms_text), int(seq_text)
+
+
+def parse_xread_command(command_parts):
+  index = 1
+  block_timeout = None
+
+  if index < len(command_parts) and command_parts[index].upper() == "BLOCK":
+    if index + 1 >= len(command_parts):
+      return None
+
+    block_timeout = int(command_parts[index + 1])
+    index += 2
+
+  if index >= len(command_parts) or command_parts[index].upper() != "STREAMS":
+    return None
+
+  values = command_parts[index + 1:]
+  if len(values) < 2 or len(values) % 2 != 0:
+    return None
+
+  half = len(values) // 2
+  keys = values[:half]
+  id_tokens = values[half:]
+
+  cursors = []
+  for key, token in zip(keys, id_tokens):
+    cursor = resolve_xread_cursor(key, token)
+    if cursor == "WRONGTYPE":
+      return "WRONGTYPE"
+
+    if cursor is None and token != "$":
+      return None
+
+    cursors.append(cursor)
+
+  return {
+    "block_timeout": block_timeout,
+    "keys": keys,
+    "cursors": cursors,
+  }
   
 def read_client(connection, selector):
   try:
@@ -419,6 +609,7 @@ def read_client(connection, selector):
     })
 
     connection.sendall(encode_bulk_string(entry_id))
+    wake_pending_xread_requests()
     return
 
   if command == "XRANGE" and len(command_parts) >= 4:
@@ -466,6 +657,37 @@ def read_client(connection, selector):
         result.append([stream_item["id"], fields])
 
     connection.sendall(encode_array(result))
+    return
+
+  if command == "XREAD":
+    parsed = parse_xread_command(command_parts)
+    if parsed is None:
+      connection.sendall(encode_error("ERR Invalid stream ID specified as stream command argument"))
+      return
+
+    if parsed == "WRONGTYPE":
+      connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return
+
+    response = build_xread_response(parsed["keys"], parsed["cursors"])
+    if response is not None:
+      connection.sendall(encode_array(response))
+      return
+
+    if parsed["block_timeout"] is None:
+      connection.sendall(encode_array(None))
+      return
+
+    deadline = None
+    if parsed["block_timeout"] > 0:
+      deadline = time.monotonic() + (parsed["block_timeout"] / 1000)
+
+    pending_xread_requests.append({
+      "connection": connection,
+      "keys": parsed["keys"],
+      "cursors": parsed["cursors"],
+      "deadline": deadline,
+    })
     return
     
   if command == "RPUSH" and len(command_parts) >= 3:
@@ -562,14 +784,7 @@ def read_client(connection, selector):
   connection.sendall(encode_simple_string("OK"))
 
 def close_client(connection, selector):
-  index = 0
-  while index < len(pending_blpop_requests):
-    request = pending_blpop_requests[index]
-    if request["connection"] == connection:
-      pending_blpop_requests.pop(index)
-      continue
-
-    index += 1
+  remove_pending_requests_for_connection(connection)
 
   try:
     selector.unregister(connection)
@@ -595,6 +810,7 @@ def main():
         callback(key.fileobj, selector)
 
       expire_pending_blpop_requests()
+      expire_pending_xread_requests()
 
 if __name__ == "__main__":
     main()
