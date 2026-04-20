@@ -81,3 +81,59 @@ Chapter 1 focused on turning a raw socket server into a small Redis-like server 
 10. Blocking retrieval with timeout
 
     I implemented [BLPOP](app/main.py) as a non-blocking wait flow: [read_client()](app/main.py) first tries to pop immediately, then stores the request in a pending queue when no values are available. New pushes wake waiting clients through [wake_pending_blpop_requests()](app/main.py), and timed waits are completed by [expire_pending_blpop_requests()](app/main.py) from the main event loop. This keeps the server responsive to concurrent clients while still supporting blocking list retrieval.
+
+## Chapter 3 - Streams
+
+Chapter 3 extended the server with Redis Streams support, including stream creation, ID validation, range queries, and blocking reads.
+
+1. The TYPE command
+
+   I added [TYPE handling](app/main.py) so keys now report `stream` when they point to stream entries. The command still returns `none` for missing or expired keys, which keeps it aligned with the existing store behavior.
+
+2. Create a stream
+
+   I introduced stream entries in [the stream helpers](app/main.py) and created them lazily when `XADD` targets a missing key. This keeps stream creation consistent with the rest of the in-memory data model.
+
+3. Validating entry IDs
+
+   I added ID parsing and validation in [the XADD path](app/main.py), so malformed stream IDs are rejected before they can be stored. That keeps the stream state ordered and predictable.
+
+4. Partially auto-generated IDs
+
+   I supported `ms-*` style IDs in [the stream ID logic](app/main.py), which lets Redis generate the sequence number while the millisecond portion is provided by the caller. This preserves ordering within the same millisecond.
+
+5. Fully auto-generated IDs
+
+   I kept `XADD` with `*` fully automatic in [generate_stream_id()](app/main.py), allowing Redis to generate both the millisecond and sequence components. The implementation also increments the sequence number when multiple entries land in the same millisecond.
+
+6. Query entries from stream
+
+   I added [XRANGE](app/main.py) to return stream entries as nested RESP arrays. The command walks the stream in insertion order and emits each matching entry with its fields.
+
+7. Query with -
+
+   I handled `-` as the lower bound in [XRANGE](app/main.py), which means the query starts from the beginning of the stream. That makes open-ended left ranges work like Redis.
+
+8. Query with +
+
+   I handled `+` as the upper bound in [XRANGE](app/main.py), which means the query can extend through the end of the stream. This completes the open-ended range syntax.
+
+9. Query single stream using XREAD
+
+   I added [XREAD](app/main.py) support for one stream by reading from a key and returning only entries newer than the supplied cursor. The response format matches Redis stream replies, so the caller gets the stream name and matching entries together.
+
+10. Query multiple streams using XREAD
+
+    I extended [XREAD](app/main.py) to accept multiple key/cursor pairs in one request. Each stream is evaluated independently, and the response includes only the streams that have new entries.
+
+11. Blocking reads
+
+    I implemented blocking stream reads in [the XREAD path](app/main.py) by storing pending requests when no matching entries are available. When a new stream entry arrives, waiting readers are checked and released if their cursor can advance.
+
+12. Blocking reads without timeout
+
+    I supported `BLOCK 0` in [XREAD](app/main.py), which leaves the request pending until new data arrives. That matches the indefinite blocking behavior expected by Redis.
+
+13. Blocking reads using $
+
+    I supported `$` cursors in [XREAD](app/main.py) so blocking consumers can wait for entries that arrive after the current stream tail. This makes the consumer start from the latest known position and only receive future updates.

@@ -6,6 +6,7 @@ import time
 store = {}
 pending_blpop_requests = []
 pending_xread_requests = []
+transaction_commands = {}
 
 def parse_resp_command(data):
   parts = data.split(b"\r\n")
@@ -59,6 +60,9 @@ def encode_array(values):
 def encode_resp(value):
   if value is None:
     return b"$-1\r\n"
+
+  if isinstance(value, dict) and value.get("type") == "error":
+    return encode_error(value["message"])
 
   if isinstance(value, int):
     return encode_integer(value)
@@ -123,6 +127,10 @@ def get_value(key):
   return entry["value"]
 
 
+def make_error_value(message):
+  return {"type": "error", "message": message}
+
+
 def get_list_for_write(key):
   entry = get_entry(key)
   if entry is None:
@@ -146,15 +154,15 @@ def get_stream_for_write(key):
   return entry["value"]
 
 
-  def get_stream_for_read(key):
-    entry = get_entry(key)
-    if entry is None:
-      return []
+def get_stream_for_read(key):
+  entry = get_entry(key)
+  if entry is None:
+    return []
 
-    if entry["type"] != "stream":
-      return None
+  if entry["type"] != "stream":
+    return None
 
-    return entry["value"]
+  return entry["value"]
 
 def generate_stream_id(entry, requested_ms=None):
   current_ms = int(time.time() * 1000) if requested_ms is None else requested_ms
@@ -250,6 +258,79 @@ def get_pending_request_deadlines():
   return deadlines
 
 
+def get_transaction_queue(connection):
+  return transaction_commands.setdefault(connection, [])
+
+
+def clear_transaction(connection):
+  transaction_commands.pop(connection, None)
+
+
+def is_transaction_active(connection):
+  return connection in transaction_commands
+
+
+def apply_incr(key):
+  entry = get_entry(key)
+  if entry is None:
+    store[key] = make_string_entry("1")
+    return 1
+
+  if entry["type"] != "string":
+    return make_error_value("ERR value is not an integer or out of range")
+
+  try:
+    current_value = int(entry["value"])
+  except ValueError:
+    return make_error_value("ERR value is not an integer or out of range")
+
+  current_value += 1
+  entry["value"] = str(current_value)
+  return current_value
+
+
+def execute_transaction_command(command_parts):
+  command = command_parts[0].upper()
+
+  if command == "INCR" and len(command_parts) >= 2:
+    return apply_incr(command_parts[1])
+
+  if command == "GET" and len(command_parts) >= 2:
+    return get_value(command_parts[1])
+
+  if command == "SET" and len(command_parts) >= 3:
+    key = command_parts[1]
+    value = command_parts[2]
+
+    expires_at = None
+    if len(command_parts) >= 5:
+      option = command_parts[3].upper()
+      option_value = command_parts[4]
+
+      if option == "PX":
+        expires_at = time.monotonic() + (int(option_value) / 1000)
+      elif option == "EX":
+        expires_at = time.monotonic() + int(option_value)
+
+    store[key] = make_string_entry(value, expires_at)
+    return "OK"
+
+  if command == "TYPE" and len(command_parts) >= 2:
+    entry = get_entry(command_parts[1])
+    if entry is None:
+      return "none"
+
+    return entry["type"]
+
+  if command == "PING":
+    return "PONG"
+
+  if command == "ECHO" and len(command_parts) >= 2:
+    return command_parts[1]
+
+  return make_error_value("ERR unknown command")
+
+
 def remove_pending_requests_for_connection(connection):
   index = 0
   while index < len(pending_blpop_requests):
@@ -259,6 +340,9 @@ def remove_pending_requests_for_connection(connection):
       continue
 
     index += 1
+
+
+  clear_transaction(connection)
 
   index = 0
   while index < len(pending_xread_requests):
@@ -488,6 +572,17 @@ def parse_xread_command(command_parts):
     "keys": keys,
     "cursors": cursors,
   }
+
+
+def execute_transaction_queue(connection, selector):
+  queued_commands = transaction_commands.get(connection, [])
+  results = []
+
+  for queued_command in queued_commands:
+    results.append(execute_transaction_command(queued_command))
+
+  clear_transaction(connection)
+  connection.sendall(encode_array(results))
   
 def read_client(connection, selector):
   try:
@@ -506,6 +601,37 @@ def read_client(connection, selector):
     return
   
   command = command_parts[0].upper()
+
+  if is_transaction_active(connection):
+    if command == "EXEC":
+      execute_transaction_queue(connection, selector)
+      return
+
+    if command == "DISCARD":
+      clear_transaction(connection)
+      connection.sendall(encode_simple_string("OK"))
+      return
+
+    if command == "MULTI":
+      connection.sendall(encode_error("ERR MULTI calls can not be nested"))
+      return
+
+    get_transaction_queue(connection).append(command_parts)
+    connection.sendall(encode_simple_string("QUEUED"))
+    return
+
+  if command == "MULTI":
+    get_transaction_queue(connection)
+    connection.sendall(encode_simple_string("OK"))
+    return
+
+  if command == "EXEC":
+    connection.sendall(encode_error("ERR EXEC without MULTI"))
+    return
+
+  if command == "DISCARD":
+    connection.sendall(encode_error("ERR DISCARD without MULTI"))
+    return
   
   if command == "PING":
     connection.sendall(encode_simple_string("PONG"))
@@ -536,6 +662,15 @@ def read_client(connection, selector):
   if command == "GET" and len(command_parts) >= 2:
     key = command_parts[1]
     connection.sendall(encode_bulk_string(get_value(key)))
+    return
+
+  if command == "INCR" and len(command_parts) >= 2:
+    result = apply_incr(command_parts[1])
+    if isinstance(result, dict) and result.get("type") == "error":
+      connection.sendall(encode_error(result["message"]))
+      return
+
+    connection.sendall(encode_integer(result))
     return
   
   if command == "TYPE" and len(command_parts) >= 2:
