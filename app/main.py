@@ -511,8 +511,7 @@ def apply_acl_setuser_default(connection, modifiers):
 
   if changed_auth_config:
     authenticated_connections.clear()
-    if not is_authentication_required():
-      authenticated_connections.add(connection)
+    authenticated_connections.add(connection)
 
   return make_simple_value("OK")
 
