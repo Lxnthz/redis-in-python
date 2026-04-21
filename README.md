@@ -353,3 +353,75 @@ Chapter 8 added Redis Pub/Sub behavior for channel subscriptions, message broadc
 7. Unsubscribe
 
    I implemented `UNSUBSCRIBE` in [read_client()](app/main.py) for both explicit channels and full unsubscribe (no args). The logic uses [unsubscribe_connection_from_channel()](app/main.py) and [unsubscribe_all_channels()](app/main.py), and I also clean subscriptions on disconnect in [remove_pending_requests_for_connection()](app/main.py).
+
+## Chapter 9 - Sorted Sets
+
+Chapter 9 added sorted set support, including score-based ordering, rank lookups, and member deletion.
+
+1. Create a sorted set
+
+   I added a dedicated sorted set entry type through [make_zset_entry()](app/main.py). New sorted sets are created lazily in [get_zset_entry_for_write()](app/main.py), which keeps behavior consistent with other data structures in the server.
+
+2. Add members
+
+   I implemented `ZADD` in [execute_command()](app/main.py), accepting one or more `score member` pairs and storing them in the sorted set map. Ordering is derived from score and member name using [zset_sorted_items()](app/main.py).
+
+3. Retrieve member rank
+
+   I added `ZRANK` in [execute_command()](app/main.py), which sorts members by score then returns the member index as an integer reply. Missing members return null bulk response like Redis.
+
+4. List sorted set members
+
+   I implemented `ZRANGE` in [execute_command()](app/main.py) with score-order output and optional `WITHSCORES`. This allows listing members or interleaving members with score strings from the same command path.
+
+5. ZRANGE with negative indexes
+
+   I reused [trim_lrange()](app/main.py) for index slicing, which already handles negative offsets safely. That gives `ZRANGE` correct start/stop behavior for both positive and negative indexes.
+
+6. Count sorted set members
+
+   I added `ZCARD` in [execute_command()](app/main.py), returning the number of members stored in a sorted set as an integer response.
+
+7. Retrieve member score
+
+   I implemented `ZSCORE` in [execute_command()](app/main.py), returning the member score as a bulk string when present or null bulk when missing.
+
+8. Remove a member
+
+   I added `ZREM` in [execute_command()](app/main.py) to delete one or more members and return the number removed. When a set becomes empty, the key is deleted from the store.
+
+## Chapter 10 - Geospatial Commands
+
+Chapter 10 added geo operations on top of sorted sets, including coordinate storage, score encoding, distance calculation, and radius search.
+
+1. Respond to GEOADD
+
+   I implemented `GEOADD` in [execute_command()](app/main.py), parsing one or more `longitude latitude member` triples and returning how many new members were inserted.
+
+2. Validate coordinates
+
+   I added [validate_geo_coordinates()](app/main.py) to enforce valid longitude/latitude ranges before a location is stored. Invalid coordinates return an error response and skip write.
+
+3. Store a location
+
+   I store geo member coordinates in the sorted set entry’s geo map (`entry["geo"]`) while also writing score data to `entry["value"]`. This keeps coordinate lookup and sorted-set integration in one structure.
+
+4. Calculate location score
+
+   I implemented geospatial score encoding in [calculate_geo_score()](app/main.py), using fixed-point normalization plus bit interleaving ([interleave_26_bits()](app/main.py)). That produces sortable geo scores compatible with sorted set storage.
+
+5. Respond to GEOPOS
+
+   I added `GEOPOS` in [execute_command()](app/main.py), returning an array of coordinate pairs for requested members, with null entries for unknown members.
+
+6. Decode coordinates
+
+   I return coordinates directly from the stored geo map in `GEOPOS`, formatting values through [format_float()](app/main.py). This gives stable RESP output for longitude/latitude reads.
+
+7. Calculate distance
+
+   I implemented `GEODIST` in [execute_command()](app/main.py) using Haversine distance from [geo_distance_meters()](app/main.py), with unit conversion from [unit_to_meters_multiplier()](app/main.py) for `m`, `km`, `mi`, and `ft`.
+
+8. Search within radius
+
+   I implemented radius search with `GEOSEARCH` in [execute_command()](app/main.py), parsing arguments in [parse_geosearch_arguments()](app/main.py) and filtering results in [run_geosearch()](app/main.py). I also added `GEORADIUS` as a compatibility wrapper that translates to `GEOSEARCH`.

@@ -536,6 +536,9 @@ def encode_resp(value):
   if value is None:
     return b"$-1\r\n"
 
+  if isinstance(value, dict) and value.get("type") == "null_array":
+    return b"*-1\r\n"
+
   if isinstance(value, dict) and value.get("type") == "error":
     return encode_error(value["message"])
 
@@ -635,6 +638,10 @@ def make_error_value(message):
 
 def make_simple_value(value):
   return {"type": "simple", "value": value}
+
+
+def make_null_array_value():
+  return {"type": "null_array"}
 
 
 def watch_keys_for_connection(connection, keys):
@@ -1875,7 +1882,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     for member in command_parts[2:]:
       coordinates = entry["geo"].get(member)
       if coordinates is None:
-        response.append(None)
+        response.append(make_null_array_value())
       else:
         lon, lat = coordinates
         response.append([format_float(lon), format_float(lat)])
