@@ -759,6 +759,15 @@ def interleave_26_bits(x_value, y_value):
   return result
 
 
+def deinterleave_26_bits(value):
+  x_value = 0
+  y_value = 0
+  for bit in range(26):
+    y_value |= ((value >> (2 * bit)) & 1) << bit
+    x_value |= ((value >> (2 * bit + 1)) & 1) << bit
+  return x_value, y_value
+
+
 def calculate_geo_score(longitude, latitude):
   lon_normalized = (longitude - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN)
   lat_normalized = (latitude - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN)
@@ -771,6 +780,16 @@ def calculate_geo_score(longitude, latitude):
   lat_fixed = max(0, min(lat_fixed, max_value - 1))
 
   return float(interleave_26_bits(lon_fixed, lat_fixed))
+
+
+def decode_geo_score(score):
+  score_int = int(score)
+  lon_fixed, lat_fixed = deinterleave_26_bits(score_int)
+
+  max_value = 1 << 26
+  longitude = (lon_fixed / max_value) * (GEO_LON_MAX - GEO_LON_MIN) + GEO_LON_MIN
+  latitude = (lat_fixed / max_value) * (GEO_LAT_MAX - GEO_LAT_MIN) + GEO_LAT_MIN
+  return longitude, latitude
 
 
 def geo_distance_meters(lon1, lat1, lon2, lat2):
@@ -1881,6 +1900,11 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     response = []
     for member in command_parts[2:]:
       coordinates = entry["geo"].get(member)
+      if coordinates is None:
+        score = entry["value"].get(member)
+        if score is not None:
+          coordinates = decode_geo_score(score)
+
       if coordinates is None:
         response.append(make_null_array_value())
       else:
