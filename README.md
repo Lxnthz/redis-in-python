@@ -293,3 +293,31 @@ Chapter 6 added master-replica replication flow, including handshake, command pr
 17. WAIT with multiple comma
 
     I implemented `WAIT` polling in [handle_wait()](app/main.py) with `REPLCONF GETACK *` fan-out via [request_replica_acks()](app/main.py), then counts matching ACKs across multiple replicas in [count_acked_replicas()](app/main.py). This supports multi-replica/multi-round acknowledgement scenarios in one `WAIT` flow.
+
+## Chapter 7 - RDB Persistence
+
+Chapter 7 added RDB-based startup persistence so the server can load keys and values from disk, including expiry-aware values.
+
+1. RDB file config
+
+   I added command-line configuration in [parse_server_config()](app/main.py) for `--dir` and `--dbfilename`, and exposed them through `CONFIG GET` in [execute_command()](app/main.py). The full file path is resolved by [get_rdb_path()](app/main.py), so startup loading uses the configured directory and filename.
+
+2. Read a key
+
+   I implemented `KEYS` matching in [execute_command()](app/main.py), which reads from the in-memory store populated by RDB loading and returns a RESP array. This made it possible to verify that keys were successfully loaded at boot.
+
+3. Read a string value
+
+   I added a minimal RDB parser in [load_rdb_file()](app/main.py) that supports string object entries (`opcode 0x00`) and loads them into the existing string store model. Once loaded, normal [GET handling](app/main.py) can return values without any special-case path.
+
+4. Read multiple keys
+
+   I made `KEYS` work with wildcard patterns using [fnmatch](app/main.py) in [execute_command()](app/main.py), so it can return multiple matching keys from a loaded RDB dataset. The handler also skips expired entries by calling [get_entry()](app/main.py) before including a key.
+
+5. Read multiple string values
+
+   Because [load_rdb_file()](app/main.py) iterates through the RDB keyspace and stores each parsed string entry, multiple values are available immediately after startup. Repeated `GET` calls against different keys read directly from the loaded in-memory state.
+
+6. Read value with expiry
+
+   I added expiry opcode handling (`0xFC` milliseconds, `0xFD` seconds) in [load_rdb_file()](app/main.py), convert absolute UNIX expiry to monotonic deadline with [unix_ms_to_monotonic_deadline()](app/main.py), and keep expiry enforcement centralized in [get_entry()](app/main.py). This ensures expired values are not returned after load.

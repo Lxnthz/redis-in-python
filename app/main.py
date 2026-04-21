@@ -12,6 +12,8 @@ pending_xread_requests = []
 transaction_commands = {}
 watched_keys = {}
 connection_buffers = {}
+subscribed_connections = {}
+channel_subscribers = {}
 
 role = "master"
 listen_port = 6379
@@ -860,6 +862,7 @@ def remove_pending_requests_for_connection(connection):
 
   clear_transaction(connection)
   clear_watched_keys(connection)
+  unsubscribe_all_channels(connection)
   connection_buffers.pop(connection, None)
   replica_connections.discard(connection)
   replica_ack_offsets.pop(connection, None)
@@ -926,6 +929,60 @@ def pop_from_list(key, count=None):
     del store[key]
 
   return popped_items
+
+
+def get_subscription_count(connection):
+  return len(subscribed_connections.get(connection, set()))
+
+
+def subscribe_connection_to_channel(connection, channel):
+  subscribed = subscribed_connections.setdefault(connection, set())
+  subscribed.add(channel)
+
+  subscribers = channel_subscribers.setdefault(channel, set())
+  subscribers.add(connection)
+
+  return len(subscribed)
+
+
+def unsubscribe_connection_from_channel(connection, channel):
+  subscribed = subscribed_connections.get(connection)
+  if not subscribed or channel not in subscribed:
+    return len(subscribed) if subscribed else 0
+
+  subscribed.remove(channel)
+  if not subscribed:
+    subscribed_connections.pop(connection, None)
+
+  subscribers = channel_subscribers.get(channel)
+  if subscribers is not None:
+    subscribers.discard(connection)
+    if not subscribers:
+      channel_subscribers.pop(channel, None)
+
+  return len(subscribed_connections.get(connection, set()))
+
+
+def unsubscribe_all_channels(connection):
+  channels = list(subscribed_connections.get(connection, set()))
+  for channel in channels:
+    unsubscribe_connection_from_channel(connection, channel)
+
+  return channels
+
+
+def publish_message(channel, message):
+  subscribers = list(channel_subscribers.get(channel, set()))
+
+  delivered = 0
+  for subscriber in subscribers:
+    try:
+      subscriber.sendall(encode_array(["message", channel, message]))
+      delivered += 1
+    except OSError:
+      unsubscribe_connection_from_channel(subscriber, channel)
+
+  return delivered
 
 
 def try_pop_from_keys(keys):
@@ -1284,6 +1341,12 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
       connection.sendall(encode_array(keys))
     return True
 
+  if command == "PUBLISH" and len(command_parts) >= 3:
+    delivered = publish_message(command_parts[1], command_parts[2])
+    if send_response:
+      connection.sendall(encode_integer(delivered))
+    return True
+
   if command == "PING":
     if send_response:
       connection.sendall(encode_simple_string("PONG"))
@@ -1315,10 +1378,46 @@ def read_client(connection, selector):
     if not command_parts:
       continue
 
-    if execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=True):
+    command = command_parts[0].upper()
+    in_subscribed_mode = get_subscription_count(connection) > 0
+
+    if in_subscribed_mode and command not in ("SUBSCRIBE", "UNSUBSCRIBE", "PING"):
+      connection.sendall(encode_error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
       continue
 
-    command = command_parts[0].upper()
+    if command == "SUBSCRIBE":
+      channels = command_parts[1:]
+      for channel in channels:
+        count = subscribe_connection_to_channel(connection, channel)
+        connection.sendall(encode_array(["subscribe", channel, count]))
+      continue
+
+    if command == "UNSUBSCRIBE":
+      channels = command_parts[1:]
+      if channels:
+        for channel in channels:
+          count = unsubscribe_connection_from_channel(connection, channel)
+          connection.sendall(encode_array(["unsubscribe", channel, count]))
+      else:
+        subscribed_channels = unsubscribe_all_channels(connection)
+        if not subscribed_channels:
+          connection.sendall(encode_array(["unsubscribe", None, 0]))
+        else:
+          remaining = len(subscribed_channels)
+          for channel in subscribed_channels:
+            remaining -= 1
+            connection.sendall(encode_array(["unsubscribe", channel, remaining]))
+      continue
+
+    if command == "PING" and in_subscribed_mode:
+      pong_message = ""
+      if len(command_parts) >= 2:
+        pong_message = command_parts[1]
+      connection.sendall(encode_array(["pong", pong_message]))
+      continue
+
+    if execute_command(connection, selector, command_parts, raw_command=raw_command, send_response=True):
+      continue
 
     if command == "WATCH":
       if is_transaction_active(connection):
