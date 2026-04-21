@@ -248,6 +248,51 @@ def should_persist_command(command):
   return is_aof_write_command(command)
 
 
+def parse_aof_manifest_entries():
+  entries = []
+
+  if aof_manifest_file_path is None:
+    return entries
+
+  try:
+    with open(aof_manifest_file_path, "r", encoding="utf-8") as manifest_file:
+      lines = manifest_file.readlines()
+  except FileNotFoundError:
+    return entries
+
+  for line in lines:
+    parts = line.strip().split()
+    if len(parts) != 6:
+      continue
+
+    if parts[0] != "file" or parts[2] != "seq" or parts[4] != "type":
+      continue
+
+    file_name = parts[1]
+    file_type = parts[5]
+    try:
+      seq = int(parts[3])
+    except ValueError:
+      continue
+
+    entries.append({"file": file_name, "seq": seq, "type": file_type})
+
+  entries.sort(key=lambda item: item["seq"])
+  return entries
+
+
+def get_aof_replay_file_paths():
+  entries = parse_aof_manifest_entries()
+  if not entries:
+    return []
+
+  paths = []
+  for entry in entries:
+    paths.append(os.path.join(aof_dir_path, entry["file"]))
+
+  return paths
+
+
 def initialize_aof_storage():
   global aof_dir_path
   global aof_incr_file_path
@@ -261,6 +306,14 @@ def initialize_aof_storage():
 
   aof_incr_file_path = os.path.join(aof_dir_path, get_aof_incr_file_name())
   aof_manifest_file_path = os.path.join(aof_dir_path, get_aof_manifest_file_name())
+
+  manifest_entries = parse_aof_manifest_entries()
+  if manifest_entries:
+    incremental_entries = [entry for entry in manifest_entries if entry["type"] == "i"]
+    if incremental_entries:
+      latest_incremental = incremental_entries[-1]
+      aof_incr_file_path = os.path.join(aof_dir_path, latest_incremental["file"])
+      return
 
   with open(aof_incr_file_path, "ab"):
     pass
@@ -309,28 +362,33 @@ def replay_aof_if_enabled():
   if not appendonly_enabled:
     return
 
-  if aof_incr_file_path is None:
+  if aof_dir_path is None:
     return
 
-  try:
-    with open(aof_incr_file_path, "rb") as aof_file:
-      data = aof_file.read()
-  except FileNotFoundError:
-    return
+  replay_file_paths = get_aof_replay_file_paths()
+  if not replay_file_paths and aof_incr_file_path is not None:
+    replay_file_paths = [aof_incr_file_path]
 
-  if not data:
-    return
-
-  commands = parse_resp_commands_from_bytes(data)
   aof_replay_in_progress = True
   try:
-    for command_parts in commands:
-      if not command_parts:
+    for replay_path in replay_file_paths:
+      try:
+        with open(replay_path, "rb") as aof_file:
+          data = aof_file.read()
+      except FileNotFoundError:
         continue
 
-      command = command_parts[0].upper()
-      if is_aof_write_command(command):
-        apply_replicated_write(command_parts)
+      if not data:
+        continue
+
+      commands = parse_resp_commands_from_bytes(data)
+      for command_parts in commands:
+        if not command_parts:
+          continue
+
+        command = command_parts[0].upper()
+        if is_aof_write_command(command):
+          apply_replicated_write(command_parts)
   finally:
     aof_replay_in_progress = False
 

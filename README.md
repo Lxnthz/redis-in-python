@@ -504,4 +504,4 @@ Chapter 12 added append-only file persistence, including startup recovery and se
 
 10. Replay multiple command
 
-The same replay path handles multi-command AOF files by iterating parsed command arrays in order and rebuilding state deterministically.
+    The same replay path handles multi-command AOF files by iterating parsed command arrays in order and rebuilding state deterministically.
