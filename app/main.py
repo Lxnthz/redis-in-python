@@ -36,6 +36,7 @@ authenticated_connections = set()
 appendonly_enabled = False
 appenddirname = "appendonlydir"
 appendfilename = "appendonly.aof"
+appendfsync = "everysec"
 aof_dir_path = None
 aof_incr_file_path = None
 aof_manifest_file_path = None
@@ -149,6 +150,7 @@ def parse_server_config(argv):
   global appendonly_enabled
   global appenddirname
   global appendfilename
+  global appendfsync
 
   index = 1
   while index < len(argv):
@@ -199,6 +201,11 @@ def parse_server_config(argv):
 
     if token == "--appendfilename" and index + 1 < len(argv):
       appendfilename = argv[index + 1]
+      index += 2
+      continue
+
+    if token == "--appendfsync" and index + 1 < len(argv):
+      appendfsync = argv[index + 1].lower()
       index += 2
       continue
 
@@ -1985,6 +1992,11 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     if requested_name == "appendfilename":
       if send_response:
         connection.sendall(encode_array(["appendfilename", appendfilename]))
+      return True
+
+    if requested_name == "appendfsync":
+      if send_response:
+        connection.sendall(encode_array(["appendfsync", appendfsync]))
       return True
 
     if send_response:
