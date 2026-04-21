@@ -792,6 +792,14 @@ def decode_geo_score(score):
   return longitude, latitude
 
 
+def get_geo_coordinates(entry, member):
+  score = entry["value"].get(member)
+  if score is not None:
+    return decode_geo_score(score)
+
+  return entry["geo"].get(member)
+
+
 def geo_distance_meters(lon1, lat1, lon2, lat2):
   lat1_rad = math.radians(lat1)
   lat2_rad = math.radians(lat2)
@@ -912,7 +920,7 @@ def run_geosearch(query, entry):
   center_lat = query["center_lat"]
 
   if query["from_member"] is not None:
-    base = geo_values.get(query["from_member"])
+    base = get_geo_coordinates(entry, query["from_member"])
     if base is None:
       return []
     center_lon, center_lat = base
@@ -1899,11 +1907,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
 
     response = []
     for member in command_parts[2:]:
-      coordinates = entry["geo"].get(member)
-      if coordinates is None:
-        score = entry["value"].get(member)
-        if score is not None:
-          coordinates = decode_geo_score(score)
+      coordinates = get_geo_coordinates(entry, member)
 
       if coordinates is None:
         response.append(make_null_array_value())
@@ -1937,8 +1941,8 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
         connection.sendall(encode_error("ERR unsupported unit provided. please use m, km, ft, mi"))
       return True
 
-    member1 = entry["geo"].get(command_parts[2])
-    member2 = entry["geo"].get(command_parts[3])
+    member1 = get_geo_coordinates(entry, command_parts[2])
+    member2 = get_geo_coordinates(entry, command_parts[3])
     if member1 is None or member2 is None:
       if send_response:
         connection.sendall(encode_bulk_string(None))
