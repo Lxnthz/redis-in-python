@@ -1875,7 +1875,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
 
     if entry is None:
       if send_response:
-        connection.sendall(encode_array(None))
+        connection.sendall(encode_array([None for _ in command_parts[2:]]))
       return True
 
     response = []
