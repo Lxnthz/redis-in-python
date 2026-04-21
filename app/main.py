@@ -1382,7 +1382,7 @@ def read_client(connection, selector):
     in_subscribed_mode = get_subscription_count(connection) > 0
 
     if in_subscribed_mode and command not in ("SUBSCRIBE", "UNSUBSCRIBE", "PING"):
-      connection.sendall(encode_error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
+      connection.sendall(encode_error(f"ERR can't execute '{command.lower()}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
       continue
 
     if command == "SUBSCRIBE":
