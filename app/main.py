@@ -3,6 +3,7 @@ import selectors  # noqa: F401
 import sys
 import time
 import random
+import fnmatch
 
 store = {}
 key_versions = {}
@@ -1265,6 +1266,23 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
       if send_response:
         connection.sendall(encode_bulk_string(replication_info_text()))
       return True
+
+  if command == "KEYS" and len(command_parts) >= 2:
+    pattern = command_parts[1]
+    keys = []
+
+    for key in list(store.keys()):
+      if get_entry(key) is None:
+        continue
+
+      if pattern == "*" or fnmatch.fnmatch(key, pattern):
+        keys.append(key)
+
+    keys.sort()
+
+    if send_response:
+      connection.sendall(encode_array(keys))
+    return True
 
   if command == "PING":
     if send_response:
