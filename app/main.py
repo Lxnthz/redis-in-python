@@ -787,8 +787,8 @@ def decode_geo_score(score):
   lon_fixed, lat_fixed = deinterleave_26_bits(score_int)
 
   max_value = 1 << 26
-  longitude = (lon_fixed / max_value) * (GEO_LON_MAX - GEO_LON_MIN) + GEO_LON_MIN
-  latitude = (lat_fixed / max_value) * (GEO_LAT_MAX - GEO_LAT_MIN) + GEO_LAT_MIN
+  longitude = ((lon_fixed + 0.5) / max_value) * (GEO_LON_MAX - GEO_LON_MIN) + GEO_LON_MIN
+  latitude = ((lat_fixed + 0.5) / max_value) * (GEO_LAT_MAX - GEO_LAT_MIN) + GEO_LAT_MIN
   return longitude, latitude
 
 
