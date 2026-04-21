@@ -221,3 +221,75 @@ Chapter 5 added optimistic locking support so transactions can be safely retried
 8. Unwatch on DISCARD
 
    I extended [the DISCARD handler](app/main.py) to call [clear_watched_keys()](app/main.py) when a transaction is discarded. This ensures that abandoning a transaction also clears its watches, so subsequent transactions don't inherit stale watch state. Additionally, watches are cleared on connection close in [close_client()](app/main.py) to prevent watch leaks.
+
+## Chapter 6 - Replication
+
+Chapter 6 added master-replica replication flow, including handshake, command propagation, replica acknowledgements, and `WAIT` semantics.
+
+1. The INFO command
+
+   I implemented `INFO replication` in [execute_command()](app/main.py), where the server returns replication metadata as a RESP bulk string. The payload is assembled in [replication_info_text()](app/main.py), which keeps the output centralized and easy to extend.
+
+2. The INFO command on a replica
+
+   I made [replication_info_text()](app/main.py) return replica-specific fields when role is `slave`, including `master_host`, `master_port`, and `master_link_status`. This gives clients a direct way to verify that a node is configured as a replica and linked to its upstream master.
+
+3. Initial replication ID and offset
+
+   I generate the initial master replication ID in [random_replid()](app/main.py) and initialize offset tracking with [master_repl_offset](app/main.py). During startup in [main()](app/main.py), each master instance gets a unique replid and starts at offset `0`.
+
+4. The replica sends a PING to the master
+
+   In [connect_to_master_and_handshake()](app/main.py), the replica first sends `PING` and waits for `+PONG`. This verifies basic connectivity before moving into replication-specific negotiation.
+
+5. The replica sends REPLCONF twice to the master
+
+   I added both required `REPLCONF` calls in [connect_to_master_and_handshake()](app/main.py): `REPLCONF listening-port <port>` and `REPLCONF capa psync2`. This shares replica metadata and replication capabilities with the master.
+
+6. The replica sends PSYNC to the master
+
+   After capability negotiation, the replica sends `PSYNC ? -1` in [connect_to_master_and_handshake()](app/main.py). It then reads `FULLRESYNC` and the initial RDB payload to complete bootstrap.
+
+7. Receiving a replication handshake as a master
+
+   I implemented handshake handling in [execute_command()](app/main.py) for `PING`, `REPLCONF`, and `PSYNC`, allowing the server to act as a master for inbound replica connections. Connection parsing for handshake commands is shared with regular client processing in [read_client()](app/main.py).
+
+8. Support for receiving the PSYNC command from the replica
+
+   In the `PSYNC` branch of [execute_command()](app/main.py), the master replies with `FULLRESYNC <replid> <offset>` and records the connection in [replica_connections](app/main.py). This marks the client as an active replica for future propagation and ACK tracking.
+
+9. Empty RDB transfer
+
+   I added an empty/small RDB bootstrap transfer using [EMPTY_RDB_HEX](app/main.py), which is encoded and sent right after `FULLRESYNC` in [execute_command()](app/main.py). On the replica side, [read_bulk_string_response()](app/main.py) reads that payload during handshake.
+
+10. Single-replica propagation
+
+    I implemented write propagation in [propagate_to_replicas()](app/main.py). When one replica is connected, write commands (for example `SET`) are forwarded to that replica and master replication offset advances by the propagated command length.
+
+11. Multi-replica propagation
+
+    The same [propagate_to_replicas()](app/main.py) logic fans out writes to all connected replicas and cleans up dead replica sockets. This allows one master to keep multiple replicas synchronized.
+
+12. Command processing
+
+    I added replica-side command apply logic in [apply_replicated_write()](app/main.py), and wired it through [process_master_commands()](app/main.py) and [read_master()](app/main.py). This ensures propagated writes are actually executed on replicas, not just acknowledged at the protocol layer.
+
+13. ACKs with no commands
+
+    I implemented `REPLCONF GETACK *` handling so replicas respond with `REPLCONF ACK <offset>` in [process_master_commands()](app/main.py) and `REPLCONF` handling in [execute_command()](app/main.py). This works even when no new writes were processed, using the current processed offset.
+
+14. ACKs with commands
+
+    I track replica progress in [replica_processed_offset](app/main.py) and update master-side ack state in [replica_ack_offsets](app/main.py). After commands are propagated, ACK offsets let the master know which replicas have caught up to the target replication offset.
+
+15. WAIT with no replicas
+
+    In [handle_wait()](app/main.py), `WAIT` returns `0` immediately when [replica_connections](app/main.py) is empty. This matches expected behavior when there are no connected replicas to acknowledge writes.
+
+16. WAIT with no commands
+
+    I made [count_acked_replicas()](app/main.py) return connected replica count when `master_repl_offset == 0`, so `WAIT` can succeed without waiting if there are no pending writes to replicate.
+
+17. WAIT with multiple comma
+
+    I implemented `WAIT` polling in [handle_wait()](app/main.py) with `REPLCONF GETACK *` fan-out via [request_replica_acks()](app/main.py), then counts matching ACKs across multiple replicas in [count_acked_replicas()](app/main.py). This supports multi-replica/multi-round acknowledgement scenarios in one `WAIT` flow.

@@ -14,6 +14,8 @@ connection_buffers = {}
 
 role = "master"
 listen_port = 6379
+rdb_dir = "."
+dbfilename = "dump.rdb"
 master_host = None
 master_port = None
 master_connection = None
@@ -124,6 +126,8 @@ def extract_resp_commands(connection, data):
 def parse_server_config(argv):
   global role
   global listen_port
+  global rdb_dir
+  global dbfilename
   global master_host
   global master_port
 
@@ -133,6 +137,16 @@ def parse_server_config(argv):
 
     if token == "--port" and index + 1 < len(argv):
       listen_port = int(argv[index + 1])
+      index += 2
+      continue
+
+    if token == "--dir" and index + 1 < len(argv):
+      rdb_dir = argv[index + 1]
+      index += 2
+      continue
+
+    if token == "--dbfilename" and index + 1 < len(argv):
+      dbfilename = argv[index + 1]
       index += 2
       continue
 
@@ -160,6 +174,132 @@ def parse_server_config(argv):
 def random_replid():
   alphabet = "0123456789abcdef"
   return "".join(random.choice(alphabet) for _ in range(40))
+
+
+def get_rdb_path():
+  separator = "\\" if "\\" in rdb_dir else "/"
+  return f"{rdb_dir}{separator}{dbfilename}"
+
+
+def read_rdb_length(data, index):
+  first = data[index]
+  index += 1
+  mode = (first & 0b11000000) >> 6
+
+  if mode == 0:
+    return first & 0b00111111, index, False
+
+  if mode == 1:
+    second = data[index]
+    index += 1
+    value = ((first & 0b00111111) << 8) | second
+    return value, index, False
+
+  if mode == 2:
+    value = int.from_bytes(data[index:index + 4], "big")
+    index += 4
+    return value, index, False
+
+  return first & 0b00111111, index, True
+
+
+def read_rdb_string(data, index):
+  value, index, is_encoded = read_rdb_length(data, index)
+
+  if is_encoded:
+    if value == 0:
+      raw_value = int.from_bytes(data[index:index + 1], "little", signed=True)
+      index += 1
+      return str(raw_value), index
+
+    if value == 1:
+      raw_value = int.from_bytes(data[index:index + 2], "little", signed=True)
+      index += 2
+      return str(raw_value), index
+
+    if value == 2:
+      raw_value = int.from_bytes(data[index:index + 4], "little", signed=True)
+      index += 4
+      return str(raw_value), index
+
+    raise ValueError("Unsupported encoded string in RDB")
+
+  text = data[index:index + value].decode("utf-8", errors="strict")
+  index += value
+  return text, index
+
+
+def unix_ms_to_monotonic_deadline(expires_unix_ms):
+  now_unix_ms = int(time.time() * 1000)
+  remaining_ms = expires_unix_ms - now_unix_ms
+  if remaining_ms <= 0:
+    return None
+
+  return time.monotonic() + (remaining_ms / 1000)
+
+
+def load_rdb_file():
+  path = get_rdb_path()
+
+  try:
+    with open(path, "rb") as file_handle:
+      data = file_handle.read()
+  except FileNotFoundError:
+    return
+
+  if not data.startswith(b"REDIS"):
+    return
+
+  index = 9
+  expires_unix_ms = None
+
+  while index < len(data):
+    opcode = data[index]
+    index += 1
+
+    if opcode == 0xFF:
+      break
+
+    if opcode == 0xFA:
+      _, index = read_rdb_string(data, index)
+      _, index = read_rdb_string(data, index)
+      continue
+
+    if opcode == 0xFE:
+      _, index, _ = read_rdb_length(data, index)
+      continue
+
+    if opcode == 0xFB:
+      _, index, _ = read_rdb_length(data, index)
+      _, index, _ = read_rdb_length(data, index)
+      continue
+
+    if opcode == 0xFC:
+      expires_unix_ms = int.from_bytes(data[index:index + 8], "little")
+      index += 8
+      continue
+
+    if opcode == 0xFD:
+      expires_unix_seconds = int.from_bytes(data[index:index + 4], "little")
+      expires_unix_ms = expires_unix_seconds * 1000
+      index += 4
+      continue
+
+    if opcode == 0x00:
+      key, index = read_rdb_string(data, index)
+      value, index = read_rdb_string(data, index)
+
+      expires_at = None
+      if expires_unix_ms is not None:
+        expires_at = unix_ms_to_monotonic_deadline(expires_unix_ms)
+
+      if expires_unix_ms is None or expires_at is not None:
+        store[key] = make_string_entry(value, expires_at)
+
+      expires_unix_ms = None
+      continue
+
+    raise ValueError("Unsupported RDB opcode")
 
 
 def connect_to_master_and_handshake(selector):
@@ -1104,6 +1244,22 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
       handle_wait(connection, selector, command_parts)
     return True
 
+  if command == "CONFIG" and len(command_parts) >= 3 and command_parts[1].upper() == "GET":
+    requested_name = command_parts[2].lower()
+    if requested_name == "dir":
+      if send_response:
+        connection.sendall(encode_array(["dir", rdb_dir]))
+      return True
+
+    if requested_name == "dbfilename":
+      if send_response:
+        connection.sendall(encode_array(["dbfilename", dbfilename]))
+      return True
+
+    if send_response:
+      connection.sendall(encode_array([]))
+    return True
+
   if command == "INFO":
     if len(command_parts) >= 2 and command_parts[1].lower() == "replication":
       if send_response:
@@ -1524,6 +1680,7 @@ def main():
     global master_replid
     parse_server_config(sys.argv)
     master_replid = random_replid()
+    load_rdb_file()
 
     selector = selectors.DefaultSelector()
     
