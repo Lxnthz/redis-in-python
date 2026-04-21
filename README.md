@@ -461,3 +461,47 @@ Chapter 11 added ACL and authentication support for the default user, including 
 8. Authenticate using AUTH
 
    On successful `AUTH`, the connection is marked in [authenticated_connections](app/main.py), allowing subsequent commands to execute normally while authentication is enabled.
+
+## Chapter 12 - AOF Persistence
+
+Chapter 12 added append-only file persistence, including startup recovery and selective write logging.
+
+1. Default AOF options
+
+   I added default AOF settings in [app/main.py](app/main.py): `appendonly` is disabled by default, `appenddirname` defaults to `appendonlydir`, and `appendfilename` defaults to `appendonly.aof`.
+
+2. AOF options from flags
+
+   I extended [parse_server_config()](app/main.py) to read `--appendonly`, `--appenddirname`, and `--appendfilename`, so runtime flags can override default AOF behavior.
+
+3. Create append-only directory
+
+   I create the append-only directory in [initialize_aof_storage()](app/main.py) with `os.makedirs(..., exist_ok=True)`, under the configured `dir` plus `appenddirname`.
+
+4. Create append-only file
+
+   I create the incremental AOF file in [initialize_aof_storage()](app/main.py) as `<appendfilename>.1.incr.aof`, ensuring the file exists before writes happen.
+
+5. Create manifest file
+
+   I generate a manifest file in [initialize_aof_storage()](app/main.py) as `<appendfilename>.manifest`, pointing to the incremental AOF file entry.
+
+6. Write a single command
+
+   I append RESP bytes for a successful write command via [append_command_to_aof()](app/main.py), preserving raw command format for replay.
+
+7. Write multiple commands
+
+   Repeated writes are appended sequentially to the same incremental AOF file, so multiple commands are persisted in order.
+
+8. Filter write commands
+
+   I gate AOF persistence through [should_persist_command()](app/main.py) and [is_aof_write_command()](app/main.py), so only mutating commands are appended.
+
+9. Replay a single command
+
+   On startup, [replay_aof_if_enabled()](app/main.py) parses persisted RESP commands and re-applies one-command AOF files through [apply_replicated_write()](app/main.py).
+
+10. Replay multiple command
+
+The same replay path handles multi-command AOF files by iterating parsed command arrays in order and rebuilding state deterministically.

@@ -6,6 +6,7 @@ import random
 import fnmatch
 import math
 import hashlib
+import os
 
 store = {}
 key_versions = {}
@@ -32,6 +33,13 @@ replica_connections = set()
 default_user_nopass = True
 default_user_password_hashes = []
 authenticated_connections = set()
+appendonly_enabled = False
+appenddirname = "appendonlydir"
+appendfilename = "appendonly.aof"
+aof_dir_path = None
+aof_incr_file_path = None
+aof_manifest_file_path = None
+aof_replay_in_progress = False
 
 EMPTY_RDB_HEX = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 
@@ -138,6 +146,9 @@ def parse_server_config(argv):
   global dbfilename
   global master_host
   global master_port
+  global appendonly_enabled
+  global appenddirname
+  global appendfilename
 
   index = 1
   while index < len(argv):
@@ -176,6 +187,21 @@ def parse_server_config(argv):
       role = "slave"
       continue
 
+    if token == "--appendonly" and index + 1 < len(argv):
+      appendonly_enabled = argv[index + 1].lower() == "yes"
+      index += 2
+      continue
+
+    if token == "--appenddirname" and index + 1 < len(argv):
+      appenddirname = argv[index + 1]
+      index += 2
+      continue
+
+    if token == "--appendfilename" and index + 1 < len(argv):
+      appendfilename = argv[index + 1]
+      index += 2
+      continue
+
     index += 1
 
 
@@ -187,6 +213,119 @@ def random_replid():
 def get_rdb_path():
   separator = "\\" if "\\" in rdb_dir else "/"
   return f"{rdb_dir}{separator}{dbfilename}"
+
+
+def get_aof_dir_path():
+  return os.path.join(rdb_dir, appenddirname)
+
+
+def get_aof_incr_file_name():
+  return f"{appendfilename}.1.incr.aof"
+
+
+def get_aof_manifest_file_name():
+  return f"{appendfilename}.manifest"
+
+
+def is_aof_write_command(command):
+  return command in {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD", "ZADD", "ZREM", "GEOADD"}
+
+
+def should_persist_command(command):
+  if not appendonly_enabled:
+    return False
+
+  if aof_replay_in_progress:
+    return False
+
+  return is_aof_write_command(command)
+
+
+def initialize_aof_storage():
+  global aof_dir_path
+  global aof_incr_file_path
+  global aof_manifest_file_path
+
+  if not appendonly_enabled:
+    return
+
+  aof_dir_path = get_aof_dir_path()
+  os.makedirs(aof_dir_path, exist_ok=True)
+
+  aof_incr_file_path = os.path.join(aof_dir_path, get_aof_incr_file_name())
+  aof_manifest_file_path = os.path.join(aof_dir_path, get_aof_manifest_file_name())
+
+  with open(aof_incr_file_path, "ab"):
+    pass
+
+  manifest_contents = f"file {get_aof_incr_file_name()} seq 1 type i\n"
+  with open(aof_manifest_file_path, "w", encoding="utf-8") as manifest_file:
+    manifest_file.write(manifest_contents)
+
+
+def append_command_to_aof(command, raw_command):
+  if not should_persist_command(command):
+    return
+
+  if raw_command is None:
+    return
+
+  if aof_incr_file_path is None:
+    initialize_aof_storage()
+
+  with open(aof_incr_file_path, "ab") as aof_file:
+    aof_file.write(raw_command)
+
+
+def parse_resp_commands_from_bytes(buffer):
+  commands = []
+  offset = 0
+
+  while offset < len(buffer):
+    while offset + 1 < len(buffer) and buffer[offset:offset + 2] == b"\r\n":
+      offset += 2
+
+    parsed = parse_resp_array_message(buffer, offset)
+    if parsed is None:
+      break
+
+    parts, next_offset = parsed
+    commands.append(parts)
+    offset = next_offset
+
+  return commands
+
+
+def replay_aof_if_enabled():
+  global aof_replay_in_progress
+
+  if not appendonly_enabled:
+    return
+
+  if aof_incr_file_path is None:
+    return
+
+  try:
+    with open(aof_incr_file_path, "rb") as aof_file:
+      data = aof_file.read()
+  except FileNotFoundError:
+    return
+
+  if not data:
+    return
+
+  commands = parse_resp_commands_from_bytes(data)
+  aof_replay_in_progress = True
+  try:
+    for command_parts in commands:
+      if not command_parts:
+        continue
+
+      command = command_parts[0].upper()
+      if is_aof_write_command(command):
+        apply_replicated_write(command_parts)
+  finally:
+    aof_replay_in_progress = False
 
 
 def read_rdb_length(data, index):
@@ -427,6 +566,13 @@ def replication_info_text():
     lines.append(f"master_port:{master_port}")
     lines.append("master_link_status:up")
   return "\r\n".join(lines) + "\r\n"
+
+
+def replicate_and_persist(raw_command, command):
+  if role == "master" and raw_command is not None:
+    propagate_to_replicas(raw_command)
+
+  append_command_to_aof(command, raw_command)
 
 
 def hash_password(password):
@@ -1826,6 +1972,21 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
         connection.sendall(encode_array(["dbfilename", dbfilename]))
       return True
 
+    if requested_name == "appendonly":
+      if send_response:
+        connection.sendall(encode_array(["appendonly", "yes" if appendonly_enabled else "no"]))
+      return True
+
+    if requested_name == "appenddirname":
+      if send_response:
+        connection.sendall(encode_array(["appenddirname", appenddirname]))
+      return True
+
+    if requested_name == "appendfilename":
+      if send_response:
+        connection.sendall(encode_array(["appendfilename", appendfilename]))
+      return True
+
     if send_response:
       connection.sendall(encode_array([]))
     return True
@@ -1885,8 +2046,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     if added > 0 or score_members:
       touch_key(key)
 
-    if role == "master" and raw_command is not None:
-      propagate_to_replicas(raw_command)
+    replicate_and_persist(raw_command, command)
 
     if send_response:
       connection.sendall(encode_integer(added))
@@ -2009,8 +2169,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
       if len(entry["value"]) == 0:
         del store[key]
 
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
 
     if send_response:
       connection.sendall(encode_integer(removed))
@@ -2051,8 +2210,7 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
       geo_values[member] = (lon, lat)
 
     touch_key(key)
-    if role == "master" and raw_command is not None:
-      propagate_to_replicas(raw_command)
+    replicate_and_persist(raw_command, command)
     if send_response:
       connection.sendall(encode_integer(added))
     return True
@@ -2303,8 +2461,7 @@ def read_client(connection, selector):
 
       store[key] = make_string_entry(value, expires_at)
       touch_key(key)
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
       connection.sendall(encode_simple_string("OK"))
       continue
 
@@ -2319,8 +2476,7 @@ def read_client(connection, selector):
         connection.sendall(encode_error(result["message"]))
         continue
 
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
       connection.sendall(encode_integer(result))
       continue
     
@@ -2396,8 +2552,7 @@ def read_client(connection, selector):
 
       touch_key(key)
 
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
       connection.sendall(encode_bulk_string(entry_id))
       wake_pending_xread_requests()
       continue
@@ -2491,8 +2646,7 @@ def read_client(connection, selector):
 
       list_values.extend(values)
       touch_key(key)
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
       connection.sendall(encode_integer(len(list_values)))
       wake_pending_blpop_requests()
       continue
@@ -2510,8 +2664,7 @@ def read_client(connection, selector):
         list_values.insert(0, value)
 
       touch_key(key)
-      if role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      replicate_and_persist(raw_command, command)
       connection.sendall(encode_integer(len(list_values)))
       wake_pending_blpop_requests()
       continue
@@ -2551,14 +2704,13 @@ def read_client(connection, selector):
           connection.sendall(encode_array(None))
           continue
 
-        if role == "master" and raw_command is not None:
-          propagate_to_replicas(raw_command)
+        replicate_and_persist(raw_command, command)
         connection.sendall(encode_array(popped_items))
         continue
 
       popped_item = pop_from_list(key)
-      if popped_item is not None and role == "master" and raw_command is not None:
-        propagate_to_replicas(raw_command)
+      if popped_item is not None:
+        replicate_and_persist(raw_command, command)
       connection.sendall(encode_bulk_string(popped_item))
       continue
 
@@ -2614,6 +2766,8 @@ def main():
     parse_server_config(sys.argv)
     master_replid = random_replid()
     load_rdb_file()
+    initialize_aof_storage()
+    replay_aof_if_enabled()
 
     selector = selectors.DefaultSelector()
     
