@@ -4,6 +4,7 @@ import sys
 import time
 import random
 import fnmatch
+import math
 
 store = {}
 key_versions = {}
@@ -580,6 +581,20 @@ def make_stream_entry(values=None, last_ms=0, last_seq=0):
   }
 
 
+def make_zset_entry(values=None, geo=None):
+  if values is None:
+    values = {}
+  if geo is None:
+    geo = {}
+
+  return {
+    "type": "zset",
+    "value": values,
+    "geo": geo,
+    "expires_at": None,
+  }
+
+
 def get_entry(key):
   entry = store.get(key)
   if entry is None:
@@ -678,6 +693,234 @@ def get_stream_for_read(key):
     return None
 
   return entry["value"]
+
+
+def get_zset_entry_for_write(key):
+  entry = get_entry(key)
+  if entry is None:
+    store[key] = make_zset_entry()
+    touch_key(key)
+    return store[key]
+
+  if entry["type"] != "zset":
+    return None
+
+  return entry
+
+
+def get_zset_entry_for_read(key):
+  entry = get_entry(key)
+  if entry is None:
+    return None
+
+  if entry["type"] != "zset":
+    return "WRONGTYPE"
+
+  return entry
+
+
+def zset_sorted_items(zset_values):
+  return sorted(zset_values.items(), key=lambda item: (item[1], item[0]))
+
+
+def format_float(value):
+  if value == int(value):
+    return str(int(value))
+  return f"{value:.17g}"
+
+
+GEO_LAT_MIN = -85.05112878
+GEO_LAT_MAX = 85.05112878
+GEO_LON_MIN = -180.0
+GEO_LON_MAX = 180.0
+GEO_EARTH_RADIUS_METERS = 6372797.560856
+
+
+def validate_geo_coordinates(longitude, latitude):
+  if longitude < GEO_LON_MIN or longitude > GEO_LON_MAX:
+    return False
+  if latitude < GEO_LAT_MIN or latitude > GEO_LAT_MAX:
+    return False
+  return True
+
+
+def interleave_26_bits(x_value, y_value):
+  result = 0
+  for bit in range(26):
+    result |= ((x_value >> bit) & 1) << (2 * bit + 1)
+    result |= ((y_value >> bit) & 1) << (2 * bit)
+  return result
+
+
+def calculate_geo_score(longitude, latitude):
+  lon_normalized = (longitude - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN)
+  lat_normalized = (latitude - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN)
+
+  max_value = 1 << 26
+  lon_fixed = int(lon_normalized * max_value)
+  lat_fixed = int(lat_normalized * max_value)
+
+  lon_fixed = max(0, min(lon_fixed, max_value - 1))
+  lat_fixed = max(0, min(lat_fixed, max_value - 1))
+
+  return float(interleave_26_bits(lon_fixed, lat_fixed))
+
+
+def geo_distance_meters(lon1, lat1, lon2, lat2):
+  lat1_rad = math.radians(lat1)
+  lat2_rad = math.radians(lat2)
+  delta_lat = math.radians(lat2 - lat1)
+  delta_lon = math.radians(lon2 - lon1)
+
+  a_value = (
+    math.sin(delta_lat / 2) ** 2
+    + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
+  )
+  c_value = 2 * math.atan2(math.sqrt(a_value), math.sqrt(1 - a_value))
+  return GEO_EARTH_RADIUS_METERS * c_value
+
+
+def unit_to_meters_multiplier(unit):
+  unit_lower = unit.lower()
+  if unit_lower == "m":
+    return 1.0
+  if unit_lower == "km":
+    return 1000.0
+  if unit_lower == "mi":
+    return 1609.34
+  if unit_lower == "ft":
+    return 0.3048
+  return None
+
+
+def parse_geosearch_arguments(command_parts):
+  if len(command_parts) < 8:
+    return None
+
+  key = command_parts[1]
+  index = 2
+  center_lon = None
+  center_lat = None
+  from_member = None
+
+  origin_mode = command_parts[index].upper()
+  try:
+    if origin_mode == "FROMMEMBER":
+      if index + 1 >= len(command_parts):
+        return None
+      from_member = command_parts[index + 1]
+      index += 2
+    elif origin_mode == "FROMLONLAT":
+      if index + 2 >= len(command_parts):
+        return None
+      center_lon = float(command_parts[index + 1])
+      center_lat = float(command_parts[index + 2])
+      index += 3
+    else:
+      return None
+  except ValueError:
+    return None
+
+  if index >= len(command_parts) or command_parts[index].upper() != "BYRADIUS":
+    return None
+
+  if index + 2 >= len(command_parts):
+    return None
+
+  try:
+    radius = float(command_parts[index + 1])
+  except ValueError:
+    return None
+  unit = command_parts[index + 2]
+  index += 3
+
+  withdist = False
+  withcoord = False
+  sort_desc = False
+  count = None
+
+  while index < len(command_parts):
+    option = command_parts[index].upper()
+    if option == "WITHDIST":
+      withdist = True
+      index += 1
+      continue
+    if option == "WITHCOORD":
+      withcoord = True
+      index += 1
+      continue
+    if option == "ASC":
+      sort_desc = False
+      index += 1
+      continue
+    if option == "DESC":
+      sort_desc = True
+      index += 1
+      continue
+    if option == "COUNT" and index + 1 < len(command_parts):
+      try:
+        count = int(command_parts[index + 1])
+      except ValueError:
+        return None
+      index += 2
+      continue
+    return None
+
+  return {
+    "key": key,
+    "center_lon": center_lon,
+    "center_lat": center_lat,
+    "from_member": from_member,
+    "radius": radius,
+    "unit": unit,
+    "withdist": withdist,
+    "withcoord": withcoord,
+    "sort_desc": sort_desc,
+    "count": count,
+  }
+
+
+def run_geosearch(query, entry):
+  geo_values = entry["geo"]
+  center_lon = query["center_lon"]
+  center_lat = query["center_lat"]
+
+  if query["from_member"] is not None:
+    base = geo_values.get(query["from_member"])
+    if base is None:
+      return []
+    center_lon, center_lat = base
+
+  multiplier = unit_to_meters_multiplier(query["unit"])
+  if multiplier is None:
+    return "ERR"
+
+  radius_meters = query["radius"] * multiplier
+  distances = []
+  for member, (lon, lat) in geo_values.items():
+    distance_meters = geo_distance_meters(center_lon, center_lat, lon, lat)
+    if distance_meters <= radius_meters:
+      distances.append((member, distance_meters, lon, lat))
+
+  distances.sort(key=lambda item: item[1], reverse=query["sort_desc"])
+
+  if query["count"] is not None:
+    distances = distances[:query["count"]]
+
+  results = []
+  for member, distance_meters, lon, lat in distances:
+    if not query["withdist"] and not query["withcoord"]:
+      results.append(member)
+      continue
+
+    item = [member]
+    if query["withdist"]:
+      item.append(format_float(distance_meters / multiplier))
+    if query["withcoord"]:
+      item.append([format_float(lon), format_float(lat)])
+    results.append(item)
+
+  return results
 
 def generate_stream_id(entry, requested_ms=None):
   current_ms = int(time.time() * 1000) if requested_ms is None else requested_ms
@@ -1260,6 +1503,77 @@ def apply_replicated_write(command_parts):
     touch_key(key)
     return
 
+  if command == "ZADD" and len(command_parts) >= 4:
+    key = command_parts[1]
+    score_members = command_parts[2:]
+    if len(score_members) % 2 != 0:
+      return
+
+    entry = get_zset_entry_for_write(key)
+    if entry is None:
+      return
+
+    values = entry["value"]
+    for index in range(0, len(score_members), 2):
+      try:
+        score = float(score_members[index])
+      except ValueError:
+        return
+      member = score_members[index + 1]
+      values[member] = score
+
+    touch_key(key)
+    return
+
+  if command == "ZREM" and len(command_parts) >= 3:
+    key = command_parts[1]
+    entry = get_zset_entry_for_read(key)
+    if entry is None or entry == "WRONGTYPE":
+      return
+
+    removed = 0
+    for member in command_parts[2:]:
+      if member in entry["value"]:
+        del entry["value"][member]
+        entry["geo"].pop(member, None)
+        removed += 1
+
+    if removed > 0:
+      touch_key(key)
+      if len(entry["value"]) == 0:
+        del store[key]
+    return
+
+  if command == "GEOADD" and len(command_parts) >= 5:
+    key = command_parts[1]
+    triples = command_parts[2:]
+    if len(triples) % 3 != 0:
+      return
+
+    entry = get_zset_entry_for_write(key)
+    if entry is None:
+      return
+
+    values = entry["value"]
+    geo_values = entry["geo"]
+
+    for index in range(0, len(triples), 3):
+      try:
+        lon = float(triples[index])
+        lat = float(triples[index + 1])
+      except ValueError:
+        return
+      member = triples[index + 2]
+
+      if not validate_geo_coordinates(lon, lat):
+        return
+
+      values[member] = calculate_geo_score(lon, lat)
+      geo_values[member] = (lon, lat)
+
+    touch_key(key)
+    return
+
 
 def execute_command(connection, selector, command_parts, raw_command=None, send_response=True, from_master=False):
   command = command_parts[0].upper()
@@ -1346,6 +1660,304 @@ def execute_command(connection, selector, command_parts, raw_command=None, send_
     if send_response:
       connection.sendall(encode_integer(delivered))
     return True
+
+  if command == "ZADD" and len(command_parts) >= 4:
+    key = command_parts[1]
+    score_members = command_parts[2:]
+    if len(score_members) % 2 != 0:
+      if send_response:
+        connection.sendall(encode_error("ERR syntax error"))
+      return True
+
+    entry = get_zset_entry_for_write(key)
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    values = entry["value"]
+    added = 0
+    for index in range(0, len(score_members), 2):
+      score = float(score_members[index])
+      member = score_members[index + 1]
+      if member not in values:
+        added += 1
+      values[member] = score
+
+    if added > 0 or score_members:
+      touch_key(key)
+
+    if role == "master" and raw_command is not None:
+      propagate_to_replicas(raw_command)
+
+    if send_response:
+      connection.sendall(encode_integer(added))
+    return True
+
+  if command == "ZRANK" and len(command_parts) >= 3:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_bulk_string(None))
+      return True
+
+    member = command_parts[2]
+    items = zset_sorted_items(entry["value"])
+    rank = None
+    for index, (name, _) in enumerate(items):
+      if name == member:
+        rank = index
+        break
+
+    if send_response:
+      if rank is None:
+        connection.sendall(encode_bulk_string(None))
+      else:
+        connection.sendall(encode_integer(rank))
+    return True
+
+  if command == "ZRANGE" and len(command_parts) >= 4:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_array([]))
+      return True
+
+    start = int(command_parts[2])
+    stop = int(command_parts[3])
+    withscores = len(command_parts) >= 5 and command_parts[4].upper() == "WITHSCORES"
+
+    items = zset_sorted_items(entry["value"])
+    members = [member for member, _ in items]
+    selected = trim_lrange(members, start, stop)
+
+    if withscores:
+      result = []
+      for member in selected:
+        result.append(member)
+        result.append(format_float(entry["value"][member]))
+    else:
+      result = selected
+
+    if send_response:
+      connection.sendall(encode_array(result))
+    return True
+
+  if command == "ZCARD" and len(command_parts) >= 2:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    count = 0 if entry is None else len(entry["value"])
+    if send_response:
+      connection.sendall(encode_integer(count))
+    return True
+
+  if command == "ZSCORE" and len(command_parts) >= 3:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_bulk_string(None))
+      return True
+
+    member = command_parts[2]
+    score = entry["value"].get(member)
+    if send_response:
+      if score is None:
+        connection.sendall(encode_bulk_string(None))
+      else:
+        connection.sendall(encode_bulk_string(format_float(score)))
+    return True
+
+  if command == "ZREM" and len(command_parts) >= 3:
+    key = command_parts[1]
+    entry = get_zset_entry_for_read(key)
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_integer(0))
+      return True
+
+    removed = 0
+    for member in command_parts[2:]:
+      if member in entry["value"]:
+        del entry["value"][member]
+        entry["geo"].pop(member, None)
+        removed += 1
+
+    if removed > 0:
+      touch_key(key)
+      if len(entry["value"]) == 0:
+        del store[key]
+
+      if role == "master" and raw_command is not None:
+        propagate_to_replicas(raw_command)
+
+    if send_response:
+      connection.sendall(encode_integer(removed))
+    return True
+
+  if command == "GEOADD" and len(command_parts) >= 5:
+    key = command_parts[1]
+    triples = command_parts[2:]
+    if len(triples) % 3 != 0:
+      if send_response:
+        connection.sendall(encode_error("ERR syntax error"))
+      return True
+
+    entry = get_zset_entry_for_write(key)
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    values = entry["value"]
+    geo_values = entry["geo"]
+    added = 0
+
+    for index in range(0, len(triples), 3):
+      lon = float(triples[index])
+      lat = float(triples[index + 1])
+      member = triples[index + 2]
+
+      if not validate_geo_coordinates(lon, lat):
+        if send_response:
+          connection.sendall(encode_error("ERR invalid longitude,latitude pair"))
+        return True
+
+      if member not in values:
+        added += 1
+
+      values[member] = calculate_geo_score(lon, lat)
+      geo_values[member] = (lon, lat)
+
+    touch_key(key)
+    if role == "master" and raw_command is not None:
+      propagate_to_replicas(raw_command)
+    if send_response:
+      connection.sendall(encode_integer(added))
+    return True
+
+  if command == "GEOPOS" and len(command_parts) >= 3:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_array([None for _ in command_parts[2:]]))
+      return True
+
+    response = []
+    for member in command_parts[2:]:
+      coordinates = entry["geo"].get(member)
+      if coordinates is None:
+        response.append(None)
+      else:
+        lon, lat = coordinates
+        response.append([format_float(lon), format_float(lat)])
+
+    if send_response:
+      connection.sendall(encode_array(response))
+    return True
+
+  if command == "GEODIST" and len(command_parts) >= 4:
+    entry = get_zset_entry_for_read(command_parts[1])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_bulk_string(None))
+      return True
+
+    unit = "m"
+    if len(command_parts) >= 5:
+      unit = command_parts[4]
+
+    multiplier = unit_to_meters_multiplier(unit)
+    if multiplier is None:
+      if send_response:
+        connection.sendall(encode_error("ERR unsupported unit provided. please use m, km, ft, mi"))
+      return True
+
+    member1 = entry["geo"].get(command_parts[2])
+    member2 = entry["geo"].get(command_parts[3])
+    if member1 is None or member2 is None:
+      if send_response:
+        connection.sendall(encode_bulk_string(None))
+      return True
+
+    distance = geo_distance_meters(member1[0], member1[1], member2[0], member2[1]) / multiplier
+    if send_response:
+      connection.sendall(encode_bulk_string(format_float(distance)))
+    return True
+
+  if command == "GEOSEARCH":
+    query = parse_geosearch_arguments(command_parts)
+    if query is None:
+      if send_response:
+        connection.sendall(encode_error("ERR syntax error"))
+      return True
+
+    entry = get_zset_entry_for_read(query["key"])
+    if entry == "WRONGTYPE":
+      if send_response:
+        connection.sendall(encode_error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      return True
+
+    if entry is None:
+      if send_response:
+        connection.sendall(encode_array([]))
+      return True
+
+    result = run_geosearch(query, entry)
+    if result == "ERR":
+      if send_response:
+        connection.sendall(encode_error("ERR unsupported unit provided. please use m, km, ft, mi"))
+      return True
+
+    if send_response:
+      connection.sendall(encode_array(result))
+    return True
+
+  if command == "GEORADIUS" and len(command_parts) >= 6:
+    translated = [
+      "GEOSEARCH",
+      command_parts[1],
+      "FROMLONLAT",
+      command_parts[2],
+      command_parts[3],
+      "BYRADIUS",
+      command_parts[4],
+      command_parts[5],
+    ] + command_parts[6:]
+    return execute_command(connection, selector, translated, raw_command, send_response, from_master)
 
   if command == "PING":
     if send_response:

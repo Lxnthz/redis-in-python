@@ -321,3 +321,35 @@ Chapter 7 added RDB-based startup persistence so the server can load keys and va
 6. Read value with expiry
 
    I added expiry opcode handling (`0xFC` milliseconds, `0xFD` seconds) in [load_rdb_file()](app/main.py), convert absolute UNIX expiry to monotonic deadline with [unix_ms_to_monotonic_deadline()](app/main.py), and keep expiry enforcement centralized in [get_entry()](app/main.py). This ensures expired values are not returned after load.
+
+## Chapter 8 - Pub/Sub
+
+Chapter 8 added Redis Pub/Sub behavior for channel subscriptions, message broadcasting, and subscribed-mode command handling.
+
+1. Subscribe to a channel
+
+   I implemented `SUBSCRIBE` in [read_client()](app/main.py), where a connection is registered to a channel and receives a subscribe confirmation reply. Subscription state is tracked with [subscribed_connections](app/main.py) and [channel_subscribers](app/main.py) through [subscribe_connection_to_channel()](app/main.py).
+
+2. Subscribe to multiple channels
+
+   I made `SUBSCRIBE` accept multiple channel names in one command inside [read_client()](app/main.py). The server registers each channel one by one and emits a confirmation array for each, with an updated subscription count.
+
+3. Enter subscribed mode
+
+   I added subscribed-mode detection using [get_subscription_count()](app/main.py). When a client is subscribed, [read_client()](app/main.py) restricts allowed commands and rejects unsupported ones with a Redis-style error that includes the blocked command name.
+
+4. PING in subscribed mode
+
+   I handled `PING` specially while subscribed in [read_client()](app/main.py), returning Pub/Sub-style `pong` arrays instead of normal simple-string `PONG`. This keeps behavior aligned with Redis subscribed-mode semantics.
+
+5. Publish a message
+
+   I implemented `PUBLISH` in [execute_command()](app/main.py). It calls [publish_message()](app/main.py), broadcasts to current channel subscribers, and returns the integer count of recipients that received the message.
+
+6. Deliver messages
+
+   I send message payloads in Pub/Sub format from [publish_message()](app/main.py) as `message` arrays containing channel and data. This ensures each subscribed client receives the same published event through its open connection.
+
+7. Unsubscribe
+
+   I implemented `UNSUBSCRIBE` in [read_client()](app/main.py) for both explicit channels and full unsubscribe (no args). The logic uses [unsubscribe_connection_from_channel()](app/main.py) and [unsubscribe_all_channels()](app/main.py), and I also clean subscriptions on disconnect in [remove_pending_requests_for_connection()](app/main.py).
