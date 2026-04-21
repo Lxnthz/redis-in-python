@@ -20,7 +20,7 @@ channel_subscribers = {}
 
 role = "master"
 listen_port = 6379
-rdb_dir = "."
+rdb_dir = "/app"
 dbfilename = "dump.rdb"
 master_host = None
 master_port = None
