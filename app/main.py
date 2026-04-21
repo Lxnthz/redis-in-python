@@ -5,6 +5,7 @@ import time
 import random
 import fnmatch
 import math
+import hashlib
 
 store = {}
 key_versions = {}
@@ -28,6 +29,9 @@ master_repl_offset = 0
 replica_processed_offset = 0
 replica_ack_offsets = {}
 replica_connections = set()
+default_user_nopass = True
+default_user_password_hashes = []
+authenticated_connections = set()
 
 EMPTY_RDB_HEX = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 
@@ -423,6 +427,94 @@ def replication_info_text():
     lines.append(f"master_port:{master_port}")
     lines.append("master_link_status:up")
   return "\r\n".join(lines) + "\r\n"
+
+
+def hash_password(password):
+  return hashlib.sha256(password.encode()).hexdigest()
+
+
+def is_authentication_required():
+  return (not default_user_nopass) and len(default_user_password_hashes) > 0
+
+
+def is_connection_authenticated(connection):
+  if not is_authentication_required():
+    return True
+
+  return connection in authenticated_connections
+
+
+def apply_default_user_password(password):
+  global default_user_nopass
+
+  default_user_nopass = False
+  hashed = hash_password(password)
+  if hashed not in default_user_password_hashes:
+    default_user_password_hashes.append(hashed)
+
+
+def clear_default_user_passwords():
+  default_user_password_hashes.clear()
+
+
+def default_user_flags():
+  flags = ["on"]
+  if default_user_nopass:
+    flags.append("nopass")
+  flags.extend(["allkeys", "allchannels", "allcommands"])
+  return flags
+
+
+def default_user_acl_response():
+  return [
+    "flags", default_user_flags(),
+    "passwords", list(default_user_password_hashes),
+    "commands", "+@all",
+    "keys", "~*",
+    "channels", "&*",
+    "selectors", [],
+  ]
+
+
+def apply_acl_setuser_default(connection, modifiers):
+  global default_user_nopass
+
+  changed_auth_config = False
+
+  for modifier in modifiers:
+    lower = modifier.lower()
+
+    if lower == "on":
+      continue
+
+    if lower == "nopass":
+      default_user_nopass = True
+      clear_default_user_passwords()
+      changed_auth_config = True
+      continue
+
+    if lower == "resetpass":
+      clear_default_user_passwords()
+      default_user_nopass = False
+      changed_auth_config = True
+      continue
+
+    if lower in ("allkeys", "allchannels", "allcommands"):
+      continue
+
+    if modifier.startswith(">"):
+      apply_default_user_password(modifier[1:])
+      changed_auth_config = True
+      continue
+
+    return make_error_value("ERR Error in ACL SETUSER modifier")
+
+  if changed_auth_config:
+    authenticated_connections.clear()
+    if not is_authentication_required():
+      authenticated_connections.add(connection)
+
+  return make_simple_value("OK")
 
 
 def is_write_command(command):
@@ -1143,6 +1235,7 @@ def remove_pending_requests_for_connection(connection):
   connection_buffers.pop(connection, None)
   replica_connections.discard(connection)
   replica_ack_offsets.pop(connection, None)
+  authenticated_connections.discard(connection)
 
   index = 0
   while index < len(pending_xread_requests):
@@ -1612,6 +1705,78 @@ def apply_replicated_write(command_parts):
 def execute_command(connection, selector, command_parts, raw_command=None, send_response=True, from_master=False):
   command = command_parts[0].upper()
 
+  if command == "AUTH":
+    username = "default"
+    password = None
+
+    if len(command_parts) == 2:
+      password = command_parts[1]
+    elif len(command_parts) == 3:
+      username = command_parts[1]
+      password = command_parts[2]
+    else:
+      if send_response:
+        connection.sendall(encode_error("ERR wrong number of arguments for 'auth' command"))
+      return True
+
+    if username != "default":
+      if send_response:
+        connection.sendall(encode_error("WRONGPASS invalid username-password pair or user is disabled."))
+      return True
+
+    if not default_user_password_hashes and default_user_nopass:
+      if send_response:
+        connection.sendall(encode_error("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"))
+      return True
+
+    if hash_password(password) in default_user_password_hashes:
+      authenticated_connections.add(connection)
+      if send_response:
+        connection.sendall(encode_simple_string("OK"))
+      return True
+
+    if send_response:
+      connection.sendall(encode_error("WRONGPASS invalid username-password pair or user is disabled."))
+    return True
+
+  if command == "ACL" and len(command_parts) >= 2:
+    subcommand = command_parts[1].upper()
+
+    if subcommand == "WHOAMI":
+      if send_response:
+        connection.sendall(encode_bulk_string("default"))
+      return True
+
+    if subcommand == "GETUSER" and len(command_parts) >= 3:
+      username = command_parts[2]
+      if username != "default":
+        if send_response:
+          connection.sendall(encode_bulk_string(None))
+        return True
+
+      if send_response:
+        connection.sendall(encode_array(default_user_acl_response()))
+      return True
+
+    if subcommand == "SETUSER" and len(command_parts) >= 3:
+      username = command_parts[2]
+      if username != "default":
+        if send_response:
+          connection.sendall(encode_error("ERR ACL SETUSER only supports the default user"))
+        return True
+
+      result = apply_acl_setuser_default(connection, command_parts[3:])
+      if send_response:
+        if isinstance(result, dict) and result.get("type") == "error":
+          connection.sendall(encode_error(result["message"]))
+        else:
+          connection.sendall(encode_simple_string("OK"))
+      return True
+
+    if send_response:
+      connection.sendall(encode_error("ERR unknown subcommand or wrong number of arguments for ACL"))
+    return True
+
   if command == "REPLCONF":
     if len(command_parts) >= 3 and command_parts[1].upper() == "GETACK":
       if role == "slave" and master_connection is not None:
@@ -2026,6 +2191,11 @@ def read_client(connection, selector):
       continue
 
     command = command_parts[0].upper()
+
+    if not is_connection_authenticated(connection) and command != "AUTH":
+      connection.sendall(encode_error("NOAUTH Authentication required."))
+      continue
+
     in_subscribed_mode = get_subscription_count(connection) > 0
 
     if in_subscribed_mode and command not in ("SUBSCRIBE", "UNSUBSCRIBE", "PING"):

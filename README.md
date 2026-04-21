@@ -404,7 +404,7 @@ Chapter 10 added geo operations on top of sorted sets, including coordinate stor
 
 3. Store a location
 
-   I store geo member coordinates in the sorted set entry’s geo map (`entry["geo"]`) while also writing score data to `entry["value"]`. This keeps coordinate lookup and sorted-set integration in one structure.
+   I store geo member coordinates in the sorted set entry’s geo map (`entry["geo"]`) and persist the sortable geoscore in `entry["value"]`. The score is treated as the primary representation for read commands.
 
 4. Calculate location score
 
@@ -416,12 +416,48 @@ Chapter 10 added geo operations on top of sorted sets, including coordinate stor
 
 6. Decode coordinates
 
-   I return coordinates directly from the stored geo map in `GEOPOS`, formatting values through [format_float()](app/main.py). This gives stable RESP output for longitude/latitude reads.
+   I decode coordinates from the stored geoscore in [decode_geo_score()](app/main.py), with [get_geo_coordinates()](app/main.py) preferring score-based decoding and falling back to the geo map if needed. `GEOPOS` then formats values through [format_float()](app/main.py).
 
 7. Calculate distance
 
-   I implemented `GEODIST` in [execute_command()](app/main.py) using Haversine distance from [geo_distance_meters()](app/main.py), with unit conversion from [unit_to_meters_multiplier()](app/main.py) for `m`, `km`, `mi`, and `ft`.
+   I implemented `GEODIST` in [execute_command()](app/main.py) using Haversine distance from [geo_distance_meters()](app/main.py), with coordinates resolved through [get_geo_coordinates()](app/main.py) and unit conversion from [unit_to_meters_multiplier()](app/main.py) for `m`, `km`, `mi`, and `ft`.
 
 8. Search within radius
 
    I implemented radius search with `GEOSEARCH` in [execute_command()](app/main.py), parsing arguments in [parse_geosearch_arguments()](app/main.py) and filtering results in [run_geosearch()](app/main.py). I also added `GEORADIUS` as a compatibility wrapper that translates to `GEOSEARCH`.
+
+## Chapter 11 - Authentication
+
+Chapter 11 added ACL and authentication support for the default user, including password management and command access control.
+
+1. Respond to ACL WHOAMI
+
+   I added `ACL WHOAMI` in [execute_command()](app/main.py), returning the current user as `default`.
+
+2. Respond to ACL GETUSER
+
+   I implemented `ACL GETUSER default` in [execute_command()](app/main.py), returning user properties including `flags`, `passwords`, command scope, key patterns, and channel patterns.
+
+3. The nopass flag
+
+   I track `nopass` state through [default_user_nopass](app/main.py) and expose it in [default_user_flags()](app/main.py). When `nopass` is enabled, authentication is not required.
+
+4. The passwords property
+
+   I store default-user password hashes in [default_user_password_hashes](app/main.py) using [hash_password()](app/main.py), and return them in [default_user_acl_response()](app/main.py).
+
+5. Setting default user password
+
+   I added `ACL SETUSER default` handling in [apply_acl_setuser_default()](app/main.py), supporting password modifiers like `>password`, plus `nopass` and `resetpass` behavior.
+
+6. The AUTH command
+
+   I implemented `AUTH` in [execute_command()](app/main.py) with both forms: `AUTH <password>` and `AUTH <username> <password>`, validating credentials for the `default` user.
+
+7. Enforce authentication
+
+   I added an authentication gate in [read_client()](app/main.py) that returns `NOAUTH Authentication required.` for non-`AUTH` commands when credentials are required.
+
+8. Authenticate using AUTH
+
+   On successful `AUTH`, the connection is marked in [authenticated_connections](app/main.py), allowing subsequent commands to execute normally while authentication is enabled.
