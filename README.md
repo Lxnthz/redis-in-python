@@ -14,73 +14,73 @@ Chapter 1 focused on turning a raw socket server into a small Redis-like server 
 
 1. Bind to a port
 
-   I started by creating the TCP listener in [main()](app/main.py#L117) and binding it to `localhost:6379` in [the server setup](app/main.py#L122). This gave the program a real network endpoint before I added any command logic.
+   I started by creating the TCP listener in [main()](app/main.py#L2832) and binding it to `localhost:6379` in [the server setup](app/main.py#L2844). This gave the program a real network endpoint before I added any command logic.
 
 2. Respond to PING
 
-   I added the first command branch in [read_client()](app/main.py#L58) and returned `+PONG` from [the PING handler](app/main.py#L76-L78). I kept the response simple so I could confirm the request loop worked end to end.
+   I added the first command branch in [read_client()](app/main.py#L2396) and returned `+PONG` from [the PING handler](app/main.py#L2389). I kept the response simple so I could confirm the request loop worked end to end.
 
 3. Respond to multiple PINGs
 
-   I left the server running inside the selector loop in [main()](app/main.py#L127-L131), which let the same connection handle repeated reads without restarting the process. The key idea was to keep the socket open and only react when new data arrived.
+   I left the server running inside the selector loop in [main()](app/main.py#L2852), which let the same connection handle repeated reads without restarting the process. The key idea was to keep the socket open and only react when new data arrived.
 
 4. Handle concurrent clients
 
-   I used [selectors.DefaultSelector](app/main.py#L120) together with [accept_connection()](app/main.py#L53-L56) so one process could manage many clients at once. That let the server register each client socket separately instead of blocking on a single connection.
+   I used [selectors.DefaultSelector](app/main.py#L2842) together with [accept_connection()](app/main.py#L1671) so one process could manage many clients at once. That let the server register each client socket separately instead of blocking on a single connection.
 
 5. Implement the ECHO command
 
-   I added RESP parsing in [parse_resp_command()](app/main.py#L7-L30) and returned the argument as a bulk string in [the ECHO handler](app/main.py#L80-L82). The approach was to decode just enough of the protocol to extract the command name and its payload.
+   I added RESP parsing in [parse_resp_command()](app/main.py#L47) and returned the argument as a bulk string in [the ECHO handler](app/main.py#L2514). The approach was to decode just enough of the protocol to extract the command name and its payload.
 
 6. Implement the SET & GET commands
 
-   I introduced an in-memory dictionary in [store](app/main.py#L5) and handled command state in [the SET and GET branches](app/main.py#L84-L105). `SET` saves the key-value pair, and `GET` looks it up and responds with the correct RESP bulk string.
+   I introduced an in-memory dictionary in [store](app/main.py#L11) and handled command state in [the SET and GET branches](app/main.py#L2518). `SET` saves the key-value pair, and `GET` looks it up and responds with the correct RESP bulk string.
 
 7. Expiry
 
-   I extended `SET` in [the expiry logic](app/main.py#L88-L99) to store an expiration timestamp alongside each value, and I added [get_value()](app/main.py#L41-L51) so expired keys are removed before a `GET` response is sent. I kept the implementation local to reads so the code stayed small and easy to reason about.
+   I extended `SET` in [the expiry logic](app/main.py#L2523) to store an expiration timestamp alongside each value, and I added [get_value()](app/main.py#L926) so expired keys are removed before a `GET` response is sent. I kept the implementation local to reads so the code stayed small and easy to reason about.
 
 ## Chapter 2 - Lists
 
 1. Create a List
 
-   I used lazy initialization in [get_list_for_write()](app/main.py#L78-L88), so the list is created the first time a push command targets a missing key. This kept list creation implicit and close to write paths.
+   I used lazy initialization in [get_list_for_write()](app/main.py#L971), so the list is created the first time a push command targets a missing key. This kept list creation implicit and close to write paths.
 
 2. Append an element
 
-   I implemented append behavior with [the RPUSH handler](app/main.py#L203-L214), where incoming values are added to the right side of the list. For a single value, the same path works and returns the new list length.
+   I implemented append behavior with [the RPUSH handler](app/main.py#L2708), where incoming values are added to the right side of the list. For a single value, the same path works and returns the new list length.
 
 3. Append multiple elements
 
-   I reused the same [RPUSH implementation](app/main.py#L203-L214) and accepted all remaining arguments as elements. The code extends the list in one pass, which makes single and multi append behavior consistent.
+   I reused the same [RPUSH implementation](app/main.py#L2708) and accepted all remaining arguments as elements. The code extends the list in one pass, which makes single and multi append behavior consistent.
 
 4. List elements (positive indexes)
 
-   I handled positive index ranges in [LRANGE](app/main.py#L231-L242) and delegated slicing to [trim_lrange()](app/main.py#L99-L115). This separates command parsing from index logic and keeps responses predictable.
+   I handled positive index ranges in [LRANGE](app/main.py#L2742) and delegated slicing to [trim_lrange()](app/main.py#L1470). This separates command parsing from index logic and keeps responses predictable.
 
 5. List elements (negative indexes)
 
-   Negative index normalization is done in [trim_lrange()](app/main.py#L104-L108), where negative values are translated relative to the list length. After normalization, bounds are clamped before returning a RESP array.
+   Negative index normalization is done in [trim_lrange()](app/main.py#L1475), where negative values are translated relative to the list length. After normalization, bounds are clamped before returning a RESP array.
 
 6. Prepend elements
 
-   I added prepend support in [the LPUSH handler](app/main.py#L216-L229), inserting each element at the left side of the list. This mirrors Redis behavior and returns the final list size.
+   I added prepend support in [the LPUSH handler](app/main.py#L2724), inserting each element at the left side of the list. This mirrors Redis behavior and returns the final list size.
 
 7. Query list length
 
-   I added [LLEN](app/main.py#L244-L253), which reads the list value and returns an integer reply. The path also checks for wrong-type keys to avoid mixing string and list semantics.
+   I added [LLEN](app/main.py#L2755), which reads the list value and returns an integer reply. The path also checks for wrong-type keys to avoid mixing string and list semantics.
 
 8. Remove an element
 
-   I implemented single-element removal via [LPOP](app/main.py#L255-L271) and [pop_from_list()](app/main.py#L118-L124). The command pops from the left and returns a bulk string reply.
+   I implemented single-element removal via [LPOP](app/main.py#L2766) and [pop_from_list()](app/main.py#L1489). The command pops from the left and returns a bulk string reply.
 
 9. Remove multiple elements
 
-   I extended [LPOP](app/main.py#L255-L267) with the optional count argument and reused [pop_from_list()](app/main.py#L126-L136) to remove up to count items. This returns a RESP array and deletes the key when the list becomes empty.
+   I extended [LPOP](app/main.py#L2766) with the optional count argument and reused [pop_from_list()](app/main.py#L1489) to remove up to count items. This returns a RESP array and deletes the key when the list becomes empty.
 
 10. Blocking retrieval with timeout
 
-    I implemented [BLPOP](app/main.py) as a non-blocking wait flow: [read_client()](app/main.py) first tries to pop immediately, then stores the request in a pending queue when no values are available. New pushes wake waiting clients through [wake_pending_blpop_requests()](app/main.py), and timed waits are completed by [expire_pending_blpop_requests()](app/main.py) from the main event loop. This keeps the server responsive to concurrent clients while still supporting blocking list retrieval.
+    I implemented [BLPOP](app/main.py#L2787) as a non-blocking wait flow: [read_client()](app/main.py#L2396) first tries to pop immediately, then stores the request in a pending queue when no values are available. New pushes wake waiting clients through [wake_pending_blpop_requests()](app/main.py#L1577), and timed waits are completed by [expire_pending_blpop_requests()](app/main.py#L1622) from the main event loop. This keeps the server responsive to concurrent clients while still supporting blocking list retrieval.
 
 ## Chapter 3 - Streams
 
@@ -88,55 +88,55 @@ Chapter 3 extended the server with Redis Streams support, including stream creat
 
 1. The TYPE command
 
-   I added [TYPE handling](app/main.py) so keys now report `stream` when they point to stream entries. The command still returns `none` for missing or expired keys, which keeps it aligned with the existing store behavior.
+   I added [TYPE handling](app/main.py#L2553) so keys now report `stream` when they point to stream entries. The command still returns `none` for missing or expired keys, which keeps it aligned with the existing store behavior.
 
 2. Create a stream
 
-   I introduced stream entries in [the stream helpers](app/main.py) and created them lazily when `XADD` targets a missing key. This keeps stream creation consistent with the rest of the in-memory data model.
+   I introduced stream entries in [the stream helpers](app/main.py#L876) and created them lazily when `XADD` targets a missing key. This keeps stream creation consistent with the rest of the in-memory data model.
 
 3. Validating entry IDs
 
-   I added ID parsing and validation in [the XADD path](app/main.py), so malformed stream IDs are rejected before they can be stored. That keeps the stream state ordered and predictable.
+   I added ID parsing and validation in [the XADD path](app/main.py#L2564), so malformed stream IDs are rejected before they can be stored. That keeps the stream state ordered and predictable.
 
 4. Partially auto-generated IDs
 
-   I supported `ms-*` style IDs in [the stream ID logic](app/main.py), which lets Redis generate the sequence number while the millisecond portion is provided by the caller. This preserves ordering within the same millisecond.
+   I supported `ms-*` style IDs in [the stream ID logic](app/main.py#L1261), which lets Redis generate the sequence number while the millisecond portion is provided by the caller. This preserves ordering within the same millisecond.
 
 5. Fully auto-generated IDs
 
-   I kept `XADD` with `*` fully automatic in [generate_stream_id()](app/main.py), allowing Redis to generate both the millisecond and sequence components. The implementation also increments the sequence number when multiple entries land in the same millisecond.
+   I kept `XADD` with `*` fully automatic in [generate_stream_id()](app/main.py#L1261), allowing Redis to generate both the millisecond and sequence components. The implementation also increments the sequence number when multiple entries land in the same millisecond.
 
 6. Query entries from stream
 
-   I added [XRANGE](app/main.py) to return stream entries as nested RESP arrays. The command walks the stream in insertion order and emits each matching entry with its fields.
+   I added [XRANGE](app/main.py#L2630) to return stream entries as nested RESP arrays. The command walks the stream in insertion order and emits each matching entry with its fields.
 
 7. Query with -
 
-   I handled `-` as the lower bound in [XRANGE](app/main.py), which means the query starts from the beginning of the stream. That makes open-ended left ranges work like Redis.
+   I handled `-` as the lower bound in [XRANGE](app/main.py#L2630), which means the query starts from the beginning of the stream. That makes open-ended left ranges work like Redis.
 
 8. Query with +
 
-   I handled `+` as the upper bound in [XRANGE](app/main.py), which means the query can extend through the end of the stream. This completes the open-ended range syntax.
+   I handled `+` as the upper bound in [XRANGE](app/main.py#L2630), which means the query can extend through the end of the stream. This completes the open-ended range syntax.
 
 9. Query single stream using XREAD
 
-   I added [XREAD](app/main.py) support for one stream by reading from a key and returning only entries newer than the supplied cursor. The response format matches Redis stream replies, so the caller gets the stream name and matching entries together.
+   I added [XREAD](app/main.py#L2677) support for one stream by reading from a key and returning only entries newer than the supplied cursor. The response format matches Redis stream replies, so the caller gets the stream name and matching entries together.
 
 10. Query multiple streams using XREAD
 
-    I extended [XREAD](app/main.py) to accept multiple key/cursor pairs in one request. Each stream is evaluated independently, and the response includes only the streams that have new entries.
+    I extended [XREAD](app/main.py#L2677) to accept multiple key/cursor pairs in one request. Each stream is evaluated independently, and the response includes only the streams that have new entries.
 
 11. Blocking reads
 
-    I implemented blocking stream reads in [the XREAD path](app/main.py) by storing pending requests when no matching entries are available. When a new stream entry arrives, waiting readers are checked and released if their cursor can advance.
+    I implemented blocking stream reads in [the XREAD path](app/main.py#L2677) by storing pending requests when no matching entries are available. When a new stream entry arrives, waiting readers are checked and released if their cursor can advance.
 
 12. Blocking reads without timeout
 
-    I supported `BLOCK 0` in [XREAD](app/main.py), which leaves the request pending until new data arrives. That matches the indefinite blocking behavior expected by Redis.
+    I supported `BLOCK 0` in [XREAD](app/main.py#L2677), which leaves the request pending until new data arrives. That matches the indefinite blocking behavior expected by Redis.
 
 13. Blocking reads using $
 
-    I supported `$` cursors in [XREAD](app/main.py) so blocking consumers can wait for entries that arrive after the current stream tail. This makes the consumer start from the latest known position and only receive future updates.
+    I supported `$` cursors in [XREAD](app/main.py#L2677) so blocking consumers can wait for entries that arrive after the current stream tail. This makes the consumer start from the latest known position and only receive future updates.
 
 ## Chapter 4 - Transactions
 
@@ -144,47 +144,47 @@ Chapter 4 added Redis-style transactions so multiple commands can be queued and 
 
 1. Key exists and has a numerical value INCR
 
-   I implemented [INCR](app/main.py) so existing numeric string values are parsed, incremented, and stored back as strings. This keeps the counter behavior aligned with Redis while still using the in-memory store.
+   I implemented [INCR](app/main.py#L2543) so existing numeric string values are parsed, incremented, and stored back as strings. This keeps the counter behavior aligned with Redis while still using the in-memory store.
 
 2. Key doesn't exist INCR
 
-   I made [INCR](app/main.py) create a missing key with value `1` and return the incremented integer reply. That gives the command the expected counter initialization behavior.
+   I made [INCR](app/main.py#L2543) create a missing key with value `1` and return the incremented integer reply. That gives the command the expected counter initialization behavior.
 
 3. Key exists but doesn't have a numerical value INCR
 
-   I added integer parsing checks in [the INCR handler](app/main.py), so non-numeric strings return an error instead of being coerced. This preserves Redis's strict numeric semantics.
+   I added integer parsing checks in [the INCR handler](app/main.py#L2543), so non-numeric strings return an error instead of being coerced. This preserves Redis's strict numeric semantics.
 
 4. The MULTI command
 
-   I introduced [MULTI](app/main.py) to begin a transaction for a connection and switch subsequent commands into queued mode. The server now tracks transaction state per client connection.
+   I introduced [MULTI](app/main.py#L2501) to begin a transaction for a connection and switch subsequent commands into queued mode. The server now tracks transaction state per client connection.
 
 5. The EXEC command
 
-   I implemented [EXEC](app/main.py) so queued commands are replayed in order and returned as a RESP array. Each queued command is executed against the shared in-memory state when the transaction is committed.
+   I implemented [EXEC](app/main.py#L2506) so queued commands are replayed in order and returned as a RESP array. Each queued command is executed against the shared in-memory state when the transaction is committed.
 
 6. Empty transaction
 
-   I handled empty transaction execution in [EXEC](app/main.py), which returns an empty RESP array when no commands were queued. That keeps the transaction boundary behavior predictable.
+   I handled empty transaction execution in [EXEC](app/main.py#L2506), which returns an empty RESP array when no commands were queued. That keeps the transaction boundary behavior predictable.
 
 7. Queueing commands
 
-   I made commands entered after [MULTI](app/main.py) return `QUEUED` instead of executing immediately. This lets the client build up a batch before committing it with `EXEC`.
+   I made commands entered after [MULTI](app/main.py#L2501) return `QUEUED` instead of executing immediately. This lets the client build up a batch before committing it with `EXEC`.
 
 8. Executing a transaction
 
-   I added queued-command execution in [execute_transaction_queue()](app/main.py), which runs each stored command in order and serializes the results as one transaction reply. The implementation preserves response types such as simple strings, integers, bulk strings, and errors.
+   I added queued-command execution in [execute_transaction_queue()](app/main.py#L1737), which runs each stored command in order and serializes the results as one transaction reply. The implementation preserves response types such as simple strings, integers, bulk strings, and errors.
 
 9. The DISCARD command
 
-   I implemented [DISCARD](app/main.py) to cancel the current transaction and clear any queued commands for that connection. This lets a client abandon a transaction cleanly before execution.
+   I implemented [DISCARD](app/main.py#L2510) to cancel the current transaction and clear any queued commands for that connection. This lets a client abandon a transaction cleanly before execution.
 
 10. Failures within transactions
 
-    I preserved command failures inside [EXEC](app/main.py) as error entries in the returned array rather than aborting the whole transaction. That matches the expected Redis behavior where a failing command still occupies its slot in the result list.
+    I preserved command failures inside [EXEC](app/main.py#L2506) as error entries in the returned array rather than aborting the whole transaction. That matches the expected Redis behavior where a failing command still occupies its slot in the result list.
 
 11. Multiple transactions
 
-    I kept transaction state isolated per connection in [transaction_commands](app/main.py), so different clients can use `MULTI`/`EXEC` independently. This allows multiple active transactions without one client interfering with another.
+    I kept transaction state isolated per connection in [transaction_commands](app/main.py#L15), so different clients can use `MULTI`/`EXEC` independently. This allows multiple active transactions without one client interfering with another.
 
 ## Chapter 5 - Optimistic Locking
 
@@ -192,35 +192,35 @@ Chapter 5 added optimistic locking support so transactions can be safely retried
 
 1. The WATCH command
 
-   I implemented [WATCH](app/main.py) to start monitoring one or more keys for changes. When `WATCH` is called, I snapshot the current version of each key in [watch_keys_for_connection()](app/main.py) and store the per-connection watch state in [watched_keys](app/main.py). This lets the client set up a watch before starting a transaction.
+   I implemented [WATCH](app/main.py#L2466) to start monitoring one or more keys for changes. When `WATCH` is called, I snapshot the current version of each key in [watch_keys_for_connection()](app/main.py#L949) and store the per-connection watch state in [watched_keys](app/main.py#L16). This lets the client set up a watch before starting a transaction.
 
 2. WATCH inside transaction
 
-   I added a check in [the WATCH handler](app/main.py) to reject `WATCH` if a transaction is already active on that connection. This matches Redis behavior where `WATCH` must be called before `MULTI`, not inside the transaction. The command returns an error if attempted inside a transaction.
+   I added a check in [the WATCH handler](app/main.py#L2466) to reject `WATCH` if a transaction is already active on that connection. This matches Redis behavior where `WATCH` must be called before `MULTI`, not inside the transaction. The command returns an error if attempted inside a transaction.
 
 3. Tracking key modifications
 
-   I introduced a global [key_versions](app/main.py) dictionary that tracks a version counter for every key. Whenever a key is modified (via `SET`, `INCR`, `XADD`, `RPUSH`, `LPUSH`, `LPOP`, or expiry), I call [touch_key()](app/main.py) to increment its version. This leaves a timestamp of when each key was last written.
+   I introduced a global [key_versions](app/main.py#L12) dictionary that tracks a version counter for every key. Whenever a key is modified (via `SET`, `INCR`, `XADD`, `RPUSH`, `LPUSH`, `LPOP`, or expiry), I call [touch_key()](app/main.py#L917) to increment its version. This leaves a timestamp of when each key was last written.
 
 4. Watching multiple keys
 
-   I extended [WATCH](app/main.py) to accept multiple key arguments in a single command. The implementation stores all watched keys and their versions together in the connection's watch dictionary, so a single `WATCH` call can protect multiple keys from concurrent modification.
+   I extended [WATCH](app/main.py#L2466) to accept multiple key arguments in a single command. The implementation stores all watched keys and their versions together in the connection's watch dictionary, so a single `WATCH` call can protect multiple keys from concurrent modification.
 
 5. Watching missing keys
 
-   I allow [WATCH](app/main.py) to snapshot keys that don't exist yet by calling [get_key_version()](app/main.py), which initializes missing keys with version 0. This lets the client watch for the creation of a key that might not exist initially, which is useful for implementing optimistic locking patterns on newly created data.
+   I allow [WATCH](app/main.py#L2466) to snapshot keys that don't exist yet by calling [get_key_version()](app/main.py#L921), which initializes missing keys with version 0. This lets the client watch for the creation of a key that might not exist initially, which is useful for implementing optimistic locking patterns on newly created data.
 
 6. The UNWATCH command
 
-   I implemented [UNWATCH](app/main.py) to clear all watched keys for a connection. This is called in [clear_watched_keys()](app/main.py) and is useful if the client wants to abandon a watch or start fresh with a different set of keys.
+   I implemented [UNWATCH](app/main.py#L2474) to clear all watched keys for a connection. This is called in [clear_watched_keys()](app/main.py#L955) and is useful if the client wants to abandon a watch or start fresh with a different set of keys.
 
 7. Unwatch on EXEC
 
-   I added a call to [clear_watched_keys()](app/main.py) inside [execute_transaction_queue()](app/main.py) after a transaction executes successfully. This ensures that all watches are automatically cleared after `EXEC` completes, whether the transaction succeeded or was aborted due to a conflict.
+   I added a call to [clear_watched_keys()](app/main.py#L955) inside [execute_transaction_queue()](app/main.py#L1737) after a transaction executes successfully. This ensures that all watches are automatically cleared after `EXEC` completes, whether the transaction succeeded or was aborted due to a conflict.
 
 8. Unwatch on DISCARD
 
-   I extended [the DISCARD handler](app/main.py) to call [clear_watched_keys()](app/main.py) when a transaction is discarded. This ensures that abandoning a transaction also clears its watches, so subsequent transactions don't inherit stale watch state. Additionally, watches are cleared on connection close in [close_client()](app/main.py) to prevent watch leaks.
+   I extended [the DISCARD handler](app/main.py#L2510) to call [clear_watched_keys()](app/main.py#L955) when a transaction is discarded. This ensures that abandoning a transaction also clears its watches, so subsequent transactions don't inherit stale watch state. Additionally, watches are cleared on connection close in [close_client()](app/main.py#L2822) to prevent watch leaks.
 
 ## Chapter 6 - Replication
 
@@ -228,71 +228,71 @@ Chapter 6 added master-replica replication flow, including handshake, command pr
 
 1. The INFO command
 
-   I implemented `INFO replication` in [execute_command()](app/main.py), where the server returns replication metadata as a RESP bulk string. The payload is assembled in [replication_info_text()](app/main.py), which keeps the output centralized and easy to extend.
+   I implemented `INFO replication` in [execute_command()](app/main.py#L1915), where the server returns replication metadata as a RESP bulk string. The payload is assembled in [replication_info_text()](app/main.py#L624), which keeps the output centralized and easy to extend.
 
 2. The INFO command on a replica
 
-   I made [replication_info_text()](app/main.py) return replica-specific fields when role is `slave`, including `master_host`, `master_port`, and `master_link_status`. This gives clients a direct way to verify that a node is configured as a replica and linked to its upstream master.
+   I made [replication_info_text()](app/main.py#L624) return replica-specific fields when role is `slave`, including `master_host`, `master_port`, and `master_link_status`. This gives clients a direct way to verify that a node is configured as a replica and linked to its upstream master.
 
 3. Initial replication ID and offset
 
-   I generate the initial master replication ID in [random_replid()](app/main.py) and initialize offset tracking with [master_repl_offset](app/main.py). During startup in [main()](app/main.py), each master instance gets a unique replid and starts at offset `0`.
+   I generate the initial master replication ID in [random_replid()](app/main.py#L215) and initialize offset tracking with [master_repl_offset](app/main.py#L29). During startup in [main()](app/main.py#L2832), each master instance gets a unique replid and starts at offset `0`.
 
 4. The replica sends a PING to the master
 
-   In [connect_to_master_and_handshake()](app/main.py), the replica first sends `PING` and waits for `+PONG`. This verifies basic connectivity before moving into replication-specific negotiation.
+   In [connect_to_master_and_handshake()](app/main.py#L517), the replica first sends `PING` and waits for `+PONG`. This verifies basic connectivity before moving into replication-specific negotiation.
 
 5. The replica sends REPLCONF twice to the master
 
-   I added both required `REPLCONF` calls in [connect_to_master_and_handshake()](app/main.py): `REPLCONF listening-port <port>` and `REPLCONF capa psync2`. This shares replica metadata and replication capabilities with the master.
+   I added both required `REPLCONF` calls in [connect_to_master_and_handshake()](app/main.py#L517): `REPLCONF listening-port <port>` and `REPLCONF capa psync2`. This shares replica metadata and replication capabilities with the master.
 
 6. The replica sends PSYNC to the master
 
-   After capability negotiation, the replica sends `PSYNC ? -1` in [connect_to_master_and_handshake()](app/main.py). It then reads `FULLRESYNC` and the initial RDB payload to complete bootstrap.
+   After capability negotiation, the replica sends `PSYNC ? -1` in [connect_to_master_and_handshake()](app/main.py#L517). It then reads `FULLRESYNC` and the initial RDB payload to complete bootstrap.
 
 7. Receiving a replication handshake as a master
 
-   I implemented handshake handling in [execute_command()](app/main.py) for `PING`, `REPLCONF`, and `PSYNC`, allowing the server to act as a master for inbound replica connections. Connection parsing for handshake commands is shared with regular client processing in [read_client()](app/main.py).
+   I implemented handshake handling in [execute_command()](app/main.py#L1915) for `PING`, `REPLCONF`, and `PSYNC`, allowing the server to act as a master for inbound replica connections. Connection parsing for handshake commands is shared with regular client processing in [read_client()](app/main.py#L2396).
 
 8. Support for receiving the PSYNC command from the replica
 
-   In the `PSYNC` branch of [execute_command()](app/main.py), the master replies with `FULLRESYNC <replid> <offset>` and records the connection in [replica_connections](app/main.py). This marks the client as an active replica for future propagation and ACK tracking.
+   In the `PSYNC` branch of [execute_command()](app/main.py#L1915), the master replies with `FULLRESYNC <replid> <offset>` and records the connection in [replica_connections](app/main.py#L32). This marks the client as an active replica for future propagation and ACK tracking.
 
 9. Empty RDB transfer
 
-   I added an empty/small RDB bootstrap transfer using [EMPTY_RDB_HEX](app/main.py), which is encoded and sent right after `FULLRESYNC` in [execute_command()](app/main.py). On the replica side, [read_bulk_string_response()](app/main.py) reads that payload during handshake.
+   I added an empty/small RDB bootstrap transfer using [EMPTY_RDB_HEX](app/main.py#L45), which is encoded and sent right after `FULLRESYNC` in [execute_command()](app/main.py#L1915). On the replica side, [read_bulk_string_response()](app/main.py#L587) reads that payload during handshake.
 
 10. Single-replica propagation
 
-    I implemented write propagation in [propagate_to_replicas()](app/main.py). When one replica is connected, write commands (for example `SET`) are forwarded to that replica and master replication offset advances by the propagated command length.
+    I implemented write propagation in [propagate_to_replicas()](app/main.py#L734). When one replica is connected, write commands (for example `SET`) are forwarded to that replica and master replication offset advances by the propagated command length.
 
 11. Multi-replica propagation
 
-    The same [propagate_to_replicas()](app/main.py) logic fans out writes to all connected replicas and cleans up dead replica sockets. This allows one master to keep multiple replicas synchronized.
+    The same [propagate_to_replicas()](app/main.py#L734) logic fans out writes to all connected replicas and cleans up dead replica sockets. This allows one master to keep multiple replicas synchronized.
 
 12. Command processing
 
-    I added replica-side command apply logic in [apply_replicated_write()](app/main.py), and wired it through [process_master_commands()](app/main.py) and [read_master()](app/main.py). This ensures propagated writes are actually executed on replicas, not just acknowledged at the protocol layer.
+    I added replica-side command apply logic in [apply_replicated_write()](app/main.py#L1755), and wired it through [process_master_commands()](app/main.py#L600) and [read_master()](app/main.py#L2808). This ensures propagated writes are actually executed on replicas, not just acknowledged at the protocol layer.
 
 13. ACKs with no commands
 
-    I implemented `REPLCONF GETACK *` handling so replicas respond with `REPLCONF ACK <offset>` in [process_master_commands()](app/main.py) and `REPLCONF` handling in [execute_command()](app/main.py). This works even when no new writes were processed, using the current processed offset.
+    I implemented `REPLCONF GETACK *` handling so replicas respond with `REPLCONF ACK <offset>` in [process_master_commands()](app/main.py#L600) and `REPLCONF` handling in [execute_command()](app/main.py#L1915). This works even when no new writes were processed, using the current processed offset.
 
 14. ACKs with commands
 
-    I track replica progress in [replica_processed_offset](app/main.py) and update master-side ack state in [replica_ack_offsets](app/main.py). After commands are propagated, ACK offsets let the master know which replicas have caught up to the target replication offset.
+    I track replica progress in [replica_processed_offset](app/main.py#L30) and update master-side ack state in [replica_ack_offsets](app/main.py#L31). After commands are propagated, ACK offsets let the master know which replicas have caught up to the target replication offset.
 
 15. WAIT with no replicas
 
-    In [handle_wait()](app/main.py), `WAIT` returns `0` immediately when [replica_connections](app/main.py) is empty. This matches expected behavior when there are no connected replicas to acknowledge writes.
+    In [handle_wait()](app/main.py#L780), `WAIT` returns `0` immediately when [replica_connections](app/main.py#L32) is empty. This matches expected behavior when there are no connected replicas to acknowledge writes.
 
 16. WAIT with no commands
 
-    I made [count_acked_replicas()](app/main.py) return connected replica count when `master_repl_offset == 0`, so `WAIT` can succeed without waiting if there are no pending writes to replicate.
+    I made [count_acked_replicas()](app/main.py#L768) return connected replica count when `master_repl_offset == 0`, so `WAIT` can succeed without waiting if there are no pending writes to replicate.
 
 17. WAIT with multiple comma
 
-    I implemented `WAIT` polling in [handle_wait()](app/main.py) with `REPLCONF GETACK *` fan-out via [request_replica_acks()](app/main.py), then counts matching ACKs across multiple replicas in [count_acked_replicas()](app/main.py). This supports multi-replica/multi-round acknowledgement scenarios in one `WAIT` flow.
+    I implemented `WAIT` polling in [handle_wait()](app/main.py#L780) with `REPLCONF GETACK *` fan-out via [request_replica_acks()](app/main.py#L754), then counts matching ACKs across multiple replicas in [count_acked_replicas()](app/main.py#L768). This supports multi-replica/multi-round acknowledgement scenarios in one `WAIT` flow.
 
 ## Chapter 7 - RDB Persistence
 
@@ -300,27 +300,27 @@ Chapter 7 added RDB-based startup persistence so the server can load keys and va
 
 1. RDB file config
 
-   I added command-line configuration in [parse_server_config()](app/main.py) for `--dir` and `--dbfilename`, and exposed them through `CONFIG GET` in [execute_command()](app/main.py). The full file path is resolved by [get_rdb_path()](app/main.py), so startup loading uses the configured directory and filename.
+   I added command-line configuration in [parse_server_config()](app/main.py#L143) for `--dir` and `--dbfilename`, and exposed them through `CONFIG GET` in [execute_command()](app/main.py#L1915). The full file path is resolved by [get_rdb_path()](app/main.py#L220), so startup loading uses the configured directory and filename.
 
 2. Read a key
 
-   I implemented `KEYS` matching in [execute_command()](app/main.py), which reads from the in-memory store populated by RDB loading and returns a RESP array. This made it possible to verify that keys were successfully loaded at boot.
+   I implemented `KEYS` matching in [execute_command()](app/main.py#L1915), which reads from the in-memory store populated by RDB loading and returns a RESP array. This made it possible to verify that keys were successfully loaded at boot.
 
 3. Read a string value
 
-   I added a minimal RDB parser in [load_rdb_file()](app/main.py) that supports string object entries (`opcode 0x00`) and loads them into the existing string store model. Once loaded, normal [GET handling](app/main.py) can return values without any special-case path.
+   I added a minimal RDB parser in [load_rdb_file()](app/main.py#L453) that supports string object entries (`opcode 0x00`) and loads them into the existing string store model. Once loaded, normal [GET handling](app/main.py#L2538) can return values without any special-case path.
 
 4. Read multiple keys
 
-   I made `KEYS` work with wildcard patterns using [fnmatch](app/main.py) in [execute_command()](app/main.py), so it can return multiple matching keys from a loaded RDB dataset. The handler also skips expired entries by calling [get_entry()](app/main.py) before including a key.
+   I made `KEYS` work with wildcard patterns using [fnmatch](app/main.py#L1915) in [execute_command()](app/main.py#L1915), so it can return multiple matching keys from a loaded RDB dataset. The handler also skips expired entries by calling [get_entry()](app/main.py#L903) before including a key.
 
 5. Read multiple string values
 
-   Because [load_rdb_file()](app/main.py) iterates through the RDB keyspace and stores each parsed string entry, multiple values are available immediately after startup. Repeated `GET` calls against different keys read directly from the loaded in-memory state.
+   Because [load_rdb_file()](app/main.py#L453) iterates through the RDB keyspace and stores each parsed string entry, multiple values are available immediately after startup. Repeated `GET` calls against different keys read directly from the loaded in-memory state.
 
 6. Read value with expiry
 
-   I added expiry opcode handling (`0xFC` milliseconds, `0xFD` seconds) in [load_rdb_file()](app/main.py), convert absolute UNIX expiry to monotonic deadline with [unix_ms_to_monotonic_deadline()](app/main.py), and keep expiry enforcement centralized in [get_entry()](app/main.py). This ensures expired values are not returned after load.
+   I added expiry opcode handling (`0xFC` milliseconds, `0xFD` seconds) in [load_rdb_file()](app/main.py#L453), convert absolute UNIX expiry to monotonic deadline with [unix_ms_to_monotonic_deadline()](app/main.py#L444), and keep expiry enforcement centralized in [get_entry()](app/main.py#L903). This ensures expired values are not returned after load.
 
 ## Chapter 8 - Pub/Sub
 
@@ -328,31 +328,31 @@ Chapter 8 added Redis Pub/Sub behavior for channel subscriptions, message broadc
 
 1. Subscribe to a channel
 
-   I implemented `SUBSCRIBE` in [read_client()](app/main.py), where a connection is registered to a channel and receives a subscribe confirmation reply. Subscription state is tracked with [subscribed_connections](app/main.py) and [channel_subscribers](app/main.py) through [subscribe_connection_to_channel()](app/main.py).
+   I implemented `SUBSCRIBE` in [read_client()](app/main.py#L2396), where a connection is registered to a channel and receives a subscribe confirmation reply. Subscription state is tracked with [subscribed_connections](app/main.py#L18) and [channel_subscribers](app/main.py#L19) through [subscribe_connection_to_channel()](app/main.py#L1518).
 
 2. Subscribe to multiple channels
 
-   I made `SUBSCRIBE` accept multiple channel names in one command inside [read_client()](app/main.py). The server registers each channel one by one and emits a confirmation array for each, with an updated subscription count.
+   I made `SUBSCRIBE` accept multiple channel names in one command inside [read_client()](app/main.py#L2396). The server registers each channel one by one and emits a confirmation array for each, with an updated subscription count.
 
 3. Enter subscribed mode
 
-   I added subscribed-mode detection using [get_subscription_count()](app/main.py). When a client is subscribed, [read_client()](app/main.py) restricts allowed commands and rejects unsupported ones with a Redis-style error that includes the blocked command name.
+   I added subscribed-mode detection using [get_subscription_count()](app/main.py#L1514). When a client is subscribed, [read_client()](app/main.py#L2396) restricts allowed commands and rejects unsupported ones with a Redis-style error that includes the blocked command name.
 
 4. PING in subscribed mode
 
-   I handled `PING` specially while subscribed in [read_client()](app/main.py), returning Pub/Sub-style `pong` arrays instead of normal simple-string `PONG`. This keeps behavior aligned with Redis subscribed-mode semantics.
+   I handled `PING` specially while subscribed in [read_client()](app/main.py#L2396), returning Pub/Sub-style `pong` arrays instead of normal simple-string `PONG`. This keeps behavior aligned with Redis subscribed-mode semantics.
 
 5. Publish a message
 
-   I implemented `PUBLISH` in [execute_command()](app/main.py). It calls [publish_message()](app/main.py), broadcasts to current channel subscribers, and returns the integer count of recipients that received the message.
+   I implemented `PUBLISH` in [execute_command()](app/main.py#L1915). It calls [publish_message()](app/main.py#L1554), broadcasts to current channel subscribers, and returns the integer count of recipients that received the message.
 
 6. Deliver messages
 
-   I send message payloads in Pub/Sub format from [publish_message()](app/main.py) as `message` arrays containing channel and data. This ensures each subscribed client receives the same published event through its open connection.
+   I send message payloads in Pub/Sub format from [publish_message()](app/main.py#L1554) as `message` arrays containing channel and data. This ensures each subscribed client receives the same published event through its open connection.
 
 7. Unsubscribe
 
-   I implemented `UNSUBSCRIBE` in [read_client()](app/main.py) for both explicit channels and full unsubscribe (no args). The logic uses [unsubscribe_connection_from_channel()](app/main.py) and [unsubscribe_all_channels()](app/main.py), and I also clean subscriptions on disconnect in [remove_pending_requests_for_connection()](app/main.py).
+   I implemented `UNSUBSCRIBE` in [read_client()](app/main.py#L2396) for both explicit channels and full unsubscribe (no args). The logic uses [unsubscribe_connection_from_channel()](app/main.py#L1528) and [unsubscribe_all_channels()](app/main.py#L1546), and I also clean subscriptions on disconnect in [remove_pending_requests_for_connection()](app/main.py#L1431).
 
 ## Chapter 9 - Sorted Sets
 
@@ -360,35 +360,35 @@ Chapter 9 added sorted set support, including score-based ordering, rank lookups
 
 1. Create a sorted set
 
-   I added a dedicated sorted set entry type through [make_zset_entry()](app/main.py). New sorted sets are created lazily in [get_zset_entry_for_write()](app/main.py), which keeps behavior consistent with other data structures in the server.
+   I added a dedicated sorted set entry type through [make_zset_entry()](app/main.py#L889). New sorted sets are created lazily in [get_zset_entry_for_write()](app/main.py#L1007), which keeps behavior consistent with other data structures in the server.
 
 2. Add members
 
-   I implemented `ZADD` in [execute_command()](app/main.py), accepting one or more `score member` pairs and storing them in the sorted set map. Ordering is derived from score and member name using [zset_sorted_items()](app/main.py).
+   I implemented `ZADD` in [execute_command()](app/main.py#L1915), accepting one or more `score member` pairs and storing them in the sorted set map. Ordering is derived from score and member name using [zset_sorted_items()](app/main.py#L1031).
 
 3. Retrieve member rank
 
-   I added `ZRANK` in [execute_command()](app/main.py), which sorts members by score then returns the member index as an integer reply. Missing members return null bulk response like Redis.
+   I added `ZRANK` in [execute_command()](app/main.py#L1915), which sorts members by score then returns the member index as an integer reply. Missing members return null bulk response like Redis.
 
 4. List sorted set members
 
-   I implemented `ZRANGE` in [execute_command()](app/main.py) with score-order output and optional `WITHSCORES`. This allows listing members or interleaving members with score strings from the same command path.
+   I implemented `ZRANGE` in [execute_command()](app/main.py#L1915) with score-order output and optional `WITHSCORES`. This allows listing members or interleaving members with score strings from the same command path.
 
 5. ZRANGE with negative indexes
 
-   I reused [trim_lrange()](app/main.py) for index slicing, which already handles negative offsets safely. That gives `ZRANGE` correct start/stop behavior for both positive and negative indexes.
+   I reused [trim_lrange()](app/main.py#L1470) for index slicing, which already handles negative offsets safely. That gives `ZRANGE` correct start/stop behavior for both positive and negative indexes.
 
 6. Count sorted set members
 
-   I added `ZCARD` in [execute_command()](app/main.py), returning the number of members stored in a sorted set as an integer response.
+   I added `ZCARD` in [execute_command()](app/main.py#L1915), returning the number of members stored in a sorted set as an integer response.
 
 7. Retrieve member score
 
-   I implemented `ZSCORE` in [execute_command()](app/main.py), returning the member score as a bulk string when present or null bulk when missing.
+   I implemented `ZSCORE` in [execute_command()](app/main.py#L1915), returning the member score as a bulk string when present or null bulk when missing.
 
 8. Remove a member
 
-   I added `ZREM` in [execute_command()](app/main.py) to delete one or more members and return the number removed. When a set becomes empty, the key is deleted from the store.
+   I added `ZREM` in [execute_command()](app/main.py#L1915) to delete one or more members and return the number removed. When a set becomes empty, the key is deleted from the store.
 
 ## Chapter 10 - Geospatial Commands
 
@@ -396,11 +396,11 @@ Chapter 10 added geo operations on top of sorted sets, including coordinate stor
 
 1. Respond to GEOADD
 
-   I implemented `GEOADD` in [execute_command()](app/main.py), parsing one or more `longitude latitude member` triples and returning how many new members were inserted.
+   I implemented `GEOADD` in [execute_command()](app/main.py#L1915), parsing one or more `longitude latitude member` triples and returning how many new members were inserted.
 
 2. Validate coordinates
 
-   I added [validate_geo_coordinates()](app/main.py) to enforce valid longitude/latitude ranges before a location is stored. Invalid coordinates return an error response and skip write.
+   I added [validate_geo_coordinates()](app/main.py#L1048) to enforce valid longitude/latitude ranges before a location is stored. Invalid coordinates return an error response and skip write.
 
 3. Store a location
 
@@ -408,23 +408,23 @@ Chapter 10 added geo operations on top of sorted sets, including coordinate stor
 
 4. Calculate location score
 
-   I implemented geospatial score encoding in [calculate_geo_score()](app/main.py), using fixed-point normalization plus bit interleaving ([interleave_26_bits()](app/main.py)). That produces sortable geo scores compatible with sorted set storage.
+   I implemented geospatial score encoding in [calculate_geo_score()](app/main.py#L1073), using fixed-point normalization plus bit interleaving ([interleave_26_bits()](app/main.py#L1056)). That produces sortable geo scores compatible with sorted set storage.
 
 5. Respond to GEOPOS
 
-   I added `GEOPOS` in [execute_command()](app/main.py), returning an array of coordinate pairs for requested members, with null entries for unknown members.
+   I added `GEOPOS` in [execute_command()](app/main.py#L1915), returning an array of coordinate pairs for requested members, with null entries for unknown members.
 
 6. Decode coordinates
 
-   I decode coordinates from the stored geoscore in [decode_geo_score()](app/main.py), with [get_geo_coordinates()](app/main.py) preferring score-based decoding and falling back to the geo map if needed. `GEOPOS` then formats values through [format_float()](app/main.py).
+   I decode coordinates from the stored geoscore in [decode_geo_score()](app/main.py#L1087), with [get_geo_coordinates()](app/main.py#L1097) preferring score-based decoding and falling back to the geo map if needed. `GEOPOS` then formats values through [format_float()](app/main.py#L1035).
 
 7. Calculate distance
 
-   I implemented `GEODIST` in [execute_command()](app/main.py) using Haversine distance from [geo_distance_meters()](app/main.py), with coordinates resolved through [get_geo_coordinates()](app/main.py) and unit conversion from [unit_to_meters_multiplier()](app/main.py) for `m`, `km`, `mi`, and `ft`.
+   I implemented `GEODIST` in [execute_command()](app/main.py#L1915) using Haversine distance from [geo_distance_meters()](app/main.py#L1105), with coordinates resolved through [get_geo_coordinates()](app/main.py#L1097) and unit conversion from [unit_to_meters_multiplier()](app/main.py#L1119) for `m`, `km`, `mi`, and `ft`.
 
 8. Search within radius
 
-   I implemented radius search with `GEOSEARCH` in [execute_command()](app/main.py), parsing arguments in [parse_geosearch_arguments()](app/main.py) and filtering results in [run_geosearch()](app/main.py). I also added `GEORADIUS` as a compatibility wrapper that translates to `GEOSEARCH`.
+   I implemented radius search with `GEOSEARCH` in [execute_command()](app/main.py#L1915), parsing arguments in [parse_geosearch_arguments()](app/main.py#L1132) and filtering results in [run_geosearch()](app/main.py#L1219). I also added `GEORADIUS` as a compatibility wrapper that translates to `GEOSEARCH`.
 
 ## Chapter 11 - Authentication
 
@@ -432,35 +432,35 @@ Chapter 11 added ACL and authentication support for the default user, including 
 
 1. Respond to ACL WHOAMI
 
-   I added `ACL WHOAMI` in [execute_command()](app/main.py), returning the current user as `default`.
+   I added `ACL WHOAMI` in [execute_command()](app/main.py#L1915), returning the current user as `default`.
 
 2. Respond to ACL GETUSER
 
-   I implemented `ACL GETUSER default` in [execute_command()](app/main.py), returning user properties including `flags`, `passwords`, command scope, key patterns, and channel patterns.
+   I implemented `ACL GETUSER default` in [execute_command()](app/main.py#L1915), returning user properties including `flags`, `passwords`, command scope, key patterns, and channel patterns.
 
 3. The nopass flag
 
-   I track `nopass` state through [default_user_nopass](app/main.py) and expose it in [default_user_flags()](app/main.py). When `nopass` is enabled, authentication is not required.
+   I track `nopass` state through [default_user_nopass](app/main.py#L33) and expose it in [default_user_flags()](app/main.py#L671). When `nopass` is enabled, authentication is not required.
 
 4. The passwords property
 
-   I store default-user password hashes in [default_user_password_hashes](app/main.py) using [hash_password()](app/main.py), and return them in [default_user_acl_response()](app/main.py).
+   I store default-user password hashes in [default_user_password_hashes](app/main.py#L34) using [hash_password()](app/main.py#L643), and return them in [default_user_acl_response()](app/main.py#L679).
 
 5. Setting default user password
 
-   I added `ACL SETUSER default` handling in [apply_acl_setuser_default()](app/main.py), supporting password modifiers like `>password`, plus `nopass` and `resetpass` behavior.
+   I added `ACL SETUSER default` handling in [apply_acl_setuser_default()](app/main.py#L690), supporting password modifiers like `>password`, plus `nopass` and `resetpass` behavior.
 
 6. The AUTH command
 
-   I implemented `AUTH` in [execute_command()](app/main.py) with both forms: `AUTH <password>` and `AUTH <username> <password>`, validating credentials for the `default` user.
+   I implemented `AUTH` in [execute_command()](app/main.py#L1915) with both forms: `AUTH <password>` and `AUTH <username> <password>`, validating credentials for the `default` user.
 
 7. Enforce authentication
 
-   I added an authentication gate in [read_client()](app/main.py) that returns `NOAUTH Authentication required.` for non-`AUTH` commands when credentials are required.
+   I added an authentication gate in [read_client()](app/main.py#L2396) that returns `NOAUTH Authentication required.` for non-`AUTH` commands when credentials are required.
 
 8. Authenticate using AUTH
 
-   On successful `AUTH`, the connection is marked in [authenticated_connections](app/main.py), allowing subsequent commands to execute normally while authentication is enabled.
+   On successful `AUTH`, the connection is marked in [authenticated_connections](app/main.py#L35), allowing subsequent commands to execute normally while authentication is enabled.
 
 ## Chapter 12 - AOF Persistence
 
@@ -468,27 +468,27 @@ Chapter 12 added append-only file persistence, including startup recovery and se
 
 1. Default AOF options
 
-   I added default AOF settings in [app/main.py](app/main.py): `appendonly` is disabled by default, `appenddirname` defaults to `appendonlydir`, and `appendfilename` defaults to `appendonly.aof`.
+   I added default AOF settings in [app/main.py](app/main.py#L11): `appendonly` is disabled by default, `appenddirname` defaults to `appendonlydir`, and `appendfilename` defaults to `appendonly.aof`.
 
 2. AOF options from flags
 
-   I extended [parse_server_config()](app/main.py) to read `--appendonly`, `--appenddirname`, and `--appendfilename`, so runtime flags can override default AOF behavior.
+   I extended [parse_server_config()](app/main.py#L143) to read `--appendonly`, `--appenddirname`, and `--appendfilename`, so runtime flags can override default AOF behavior.
 
 3. Create append-only directory
 
-   I create the append-only directory in [initialize_aof_storage()](app/main.py) with `os.makedirs(..., exist_ok=True)`, under the configured `dir` plus `appenddirname`.
+   I create the append-only directory in [initialize_aof_storage()](app/main.py#L296) with `os.makedirs(..., exist_ok=True)`, under the configured `dir` plus `appenddirname`.
 
 4. Create append-only file
 
-   I create the incremental AOF file in [initialize_aof_storage()](app/main.py) as `<appendfilename>.1.incr.aof`, ensuring the file exists before writes happen.
+   I create the incremental AOF file in [initialize_aof_storage()](app/main.py#L296) as `<appendfilename>.1.incr.aof`, ensuring the file exists before writes happen.
 
 5. Create manifest file
 
-   I generate a manifest file in [initialize_aof_storage()](app/main.py) as `<appendfilename>.manifest`, pointing to the incremental AOF file entry.
+   I generate a manifest file in [initialize_aof_storage()](app/main.py#L296) as `<appendfilename>.manifest`, pointing to the incremental AOF file entry.
 
 6. Write a single command
 
-   I append RESP bytes for a successful write command via [append_command_to_aof()](app/main.py), preserving raw command format for replay.
+   I append RESP bytes for a successful write command via [append_command_to_aof()](app/main.py#L326), preserving raw command format for replay.
 
 7. Write multiple commands
 
@@ -496,11 +496,11 @@ Chapter 12 added append-only file persistence, including startup recovery and se
 
 8. Filter write commands
 
-   I gate AOF persistence through [should_persist_command()](app/main.py) and [is_aof_write_command()](app/main.py), so only mutating commands are appended.
+   I gate AOF persistence through [should_persist_command()](app/main.py#L241) and [is_aof_write_command()](app/main.py#L237), so only mutating commands are appended.
 
 9. Replay a single command
 
-   On startup, [replay_aof_if_enabled()](app/main.py) parses persisted RESP commands and re-applies one-command AOF files through [apply_replicated_write()](app/main.py).
+   On startup, [replay_aof_if_enabled()](app/main.py#L359) parses persisted RESP commands and re-applies one-command AOF files through [apply_replicated_write()](app/main.py#L1755).
 
 10. Replay multiple command
 
