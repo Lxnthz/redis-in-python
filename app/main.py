@@ -2830,33 +2830,33 @@ def close_client(connection, selector):
   connection.close()
 
 def main():
-    print("Logs from your program will appear here!")
+  print("Logs from your program will appear here!")
 
-    global master_replid
-    parse_server_config(sys.argv)
-    master_replid = random_replid()
-    load_rdb_file()
-    initialize_aof_storage()
-    replay_aof_if_enabled()
+  global master_replid
+  parse_server_config(sys.argv)
+  master_replid = random_replid()
+  load_rdb_file()
+  initialize_aof_storage()
+  replay_aof_if_enabled()
 
-    selector = selectors.DefaultSelector()
-    
-    server_socket = socket.create_server(("localhost", listen_port), reuse_port=(sys.platform != "win32"))
-    server_socket.setblocking(False)
-    
-    selector.register(server_socket, selectors.EVENT_READ, accept_connection)
+  selector = selectors.DefaultSelector()
 
-    if role == "slave":
-      connect_to_master_and_handshake(selector)
-    
-    while True:
-      events = selector.select(timeout=get_selector_timeout())
-      for key, _ in events:
-        callback = key.data
-        callback(key.fileobj, selector)
+  server_socket = socket.create_server(("localhost", listen_port), reuse_port=(sys.platform != "win32"))
+  server_socket.setblocking(False)
 
-      expire_pending_blpop_requests()
-      expire_pending_xread_requests()
+  selector.register(server_socket, selectors.EVENT_READ, accept_connection)
+
+  if role == "slave":
+    connect_to_master_and_handshake(selector)
+
+  while True:
+    events = selector.select(timeout=get_selector_timeout())
+    for key, _ in events:
+      callback = key.data
+      callback(key.fileobj, selector)
+
+    expire_pending_blpop_requests()
+    expire_pending_xread_requests()
 
 if __name__ == "__main__":
-    main()
+  main()
